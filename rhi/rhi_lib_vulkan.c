@@ -54,6 +54,12 @@ extern float psx_phase_error;    /* decoder carrier misalignment, cycles */
 extern int   psx_black_setup;    /* NTSC pedestal mismatch: 0 none, 1 lifted, 2 crushed */
 extern retro_log_printf_t log_cb;
 extern int   psx_hdr_overbright_hot;   /* additive/sub source: 0 clamped, 1 hot */
+/* "HDR True Multi-Pass Blending": 1 routes non-masked subtractive prims
+ * through the per-primitive programmable-blend path; 0 keeps them on
+ * fixed-function REVERSE_SUBTRACT and floors the result with a MAX-blend
+ * pass after each subtractive batch. Both floor at zero; see
+ * renderer_semi_trans_needs_feedback / renderer_emit_sub_floor. */
+extern int   psx_hdr_multipass;
 /* The requested color format (enum psx_color_format_e). Unlike psx_hdr_active
  * this is known at renderer init (read at startup), so it gates the wide
  * (16F) scaled framebuffer, which is allocated before HDR negotiation
@@ -5633,7 +5639,13 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       SpecConstIndex_OffsetUV = 5,
       SpecConstIndex_HotSource = 6,
       SpecConstIndex_ResolveEotf = 7,
-      SpecConstIndex_Samples = 0
+      SpecConstIndex_Samples = 0,
+      /* Feedback (programmable blend) shaders only. Aliases ResolveEotf the
+       * same way Samples aliases TransMode: the resolve/display programs and
+       * the primitive feedback programs never share a pipeline, and the
+       * pipeline hash masks spec constants by the program's reflected usage,
+       * so the slots cannot collide. */
+      SpecConstIndex_MaskTest = 7
    };
 
    struct SaveState
@@ -5731,8 +5743,8 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
             Program *hdr_bpp24_yuv_quad_blitter;
             Program *resolve_to_scaled;
             Program *resolve_to_unscaled;
-            Program *msaa_resolve_weighted;
-            Program *msaa_resolve_weighted_sdr;   /* HDR: tonemap-weighted MSAA resolve (16F only) */
+            Program *msaa_resolve_weighted;       /* light-domain MSAA resolve, Karis-weighted (rgba16f) */
+            Program *msaa_resolve_weighted_sdr;   /* light-domain MSAA resolve, plain box (rgba8) */
 
             Program *blit_vram_scaled;
             Program *blit_vram_scaled_masked;
@@ -5748,6 +5760,9 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
             Program *blit_vram_cached_unscaled_masked;
 
             Program *flat;
+            /* Zero-floor pass for fixed-function HDR subtractive blending
+             * (multipass off). flat vertex module + floor.frag. */
+            Program *flat_floor;
             Program *textured_scaled;
             Program *textured_unscaled;
             Program *flat_masked;
@@ -6197,6 +6212,9 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
    static const uint32_t msaa_resolve_weighted_comp[] =
 #include "shaders_vulkan/prebuilt/msaa_resolve_weighted.comp.inc"
       ;
+   static const uint32_t msaa_resolve_weighted_sdr_comp[] =
+#include "shaders_vulkan/prebuilt/msaa_resolve_weighted.sdr.comp.inc"
+      ;
 
    static const uint32_t flat_vert[] =
 #include "shaders_vulkan/prebuilt/flat.vert.inc"
@@ -6206,6 +6224,9 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       ;
    static const uint32_t flat_frag[] =
 #include "shaders_vulkan/prebuilt/flat.frag.inc"
+      ;
+   static const uint32_t floor_frag[] =
+#include "shaders_vulkan/prebuilt/floor.frag.inc"
       ;
    static const uint32_t textured_vert[] =
 #include "shaders_vulkan/prebuilt/textured.vert.inc"
@@ -6703,9 +6724,15 @@ static void renderer_save_vram_state(Renderer *self, SaveState *out){
 static void renderer_init_primitive_pipelines(Renderer *self)
 {
    if (self->msaa > 1 || self->scaling > 1)
+   {
       self->pipelines.flat = device_request_program_graphics_code(self->device, flat_vert, sizeof(flat_vert), flat_frag, sizeof(flat_frag));
+      self->pipelines.flat_floor = device_request_program_graphics_code(self->device, flat_vert, sizeof(flat_vert), floor_frag, sizeof(floor_frag));
+   }
    else
+   {
       self->pipelines.flat = device_request_program_graphics_code(self->device, flat_unscaled_vert, sizeof(flat_unscaled_vert), flat_frag, sizeof(flat_frag));
+      self->pipelines.flat_floor = device_request_program_graphics_code(self->device, flat_unscaled_vert, sizeof(flat_unscaled_vert), floor_frag, sizeof(floor_frag));
+   }
 
    if (self->msaa > 1)
    {
@@ -6770,6 +6797,7 @@ static void renderer_init_pipelines(Renderer *self)
       self->pipelines.resolve_to_unscaled = device_request_program_compute_code(self->device, resolve_to_unscaled, sizeof(resolve_to_unscaled));
 
    self->pipelines.msaa_resolve_weighted = device_request_program_compute_code(self->device, msaa_resolve_weighted_comp, sizeof(msaa_resolve_weighted_comp));
+   self->pipelines.msaa_resolve_weighted_sdr = device_request_program_compute_code(self->device, msaa_resolve_weighted_sdr_comp, sizeof(msaa_resolve_weighted_sdr_comp));
 
    self->pipelines.scaled_quad_blitter =
       device_request_program_graphics_code(self->device, quad_vert, sizeof(quad_vert), scaled_quad_frag, sizeof(scaled_quad_frag));
@@ -9435,6 +9463,55 @@ static void renderer_hd_texture_uniforms(Renderer *self,
    hd.texture = NULL;
 }
 
+/* True when a semi-transparent prim must go through the programmable-blend
+ * feedback program (input attachment + per-primitive by-region barrier)
+ * rather than fixed-function blending. Masked prims always do. Non-masked
+ * subtractive prims additionally do on the 16F HDR target: fixed-function
+ * REVERSE_SUBTRACT cannot floor the result at zero on a float attachment,
+ * and hardware clamps B - F at 0 per channel. The feedback program applies
+ * the floor in-shader (see primitive_feedback.frag) with the check-mask
+ * test disabled via SpecConstIndex_MaskTest. */
+static bool renderer_semi_trans_needs_feedback(const Renderer *self,
+      const SemiTransparentState *state)
+{
+   if (state->semi_transparent == SemiTransparentMode_None)
+      return false;
+   if (state->masked)
+      return true;
+   return psx_hdr_multipass &&
+      state->semi_transparent == SemiTransparentMode_Sub &&
+      self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+/* With multipass off, the same prims stay on fixed-function
+ * REVERSE_SUBTRACT and each batch is followed by a MAX-blend zero-floor
+ * pass instead (see floor.frag for why that is exact, not approximate). */
+static bool renderer_semi_trans_batch_wants_sub_floor(const Renderer *self,
+      const SemiTransparentState *state)
+{
+   return !psx_hdr_multipass &&
+      !state->masked &&
+      state->semi_transparent == SemiTransparentMode_Sub &&
+      self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+/* Draw the zero-floor quad over the current scissor. Restores the depth
+ * state the semi-transparent loop established; program and blend state are
+ * re-set by the next renderer_semi_transparent_set_state call. */
+static void renderer_emit_sub_floor(Renderer *self, unsigned first_vertex)
+{
+   commandbuffer_set_program(cbh_get(&self->cmd), self->pipelines.flat_floor);
+   commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
+   commandbuffer_set_blend_op(cbh_get(&self->cmd), VK_BLEND_OP_MAX, VK_BLEND_OP_MAX);
+   commandbuffer_set_blend_factors(cbh_get(&self->cmd), VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
+                          VK_BLEND_FACTOR_ONE);
+   commandbuffer_set_depth_test(cbh_get(&self->cmd), false, false);
+   commandbuffer_set_specialization_constant_mask(cbh_get(&self->cmd), -1);
+   commandbuffer_draw(cbh_get(&self->cmd), 6, 1, first_vertex, 0);
+   commandbuffer_set_depth_test(cbh_get(&self->cmd), true, false);
+   commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS);
+}
+
 static void renderer_render_semi_transparent_primitives(Renderer *self){
    SemiTransparentState last_state;
    unsigned to_draw;
@@ -9456,9 +9533,36 @@ static void renderer_render_semi_transparent_primitives(Renderer *self){
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 4, 0, VK_FORMAT_R16G16B16A16_SINT, offsetof(BufferVertex, u));
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 5, 0, VK_FORMAT_R16G16B16A16_UINT, offsetof(BufferVertex, min_u));
 
-   { size_t size = BufferVertexVec_size(&self->queue.semi_transparent) * sizeof(BufferVertex);
-   void *verts = commandbuffer_allocate_vertex_data(cbh_get(&self->cmd), 0, size, sizeof(BufferVertex), VK_VERTEX_INPUT_RATE_VERTEX);
+   { bool append_floor = self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+         !psx_hdr_multipass;
+   size_t size = BufferVertexVec_size(&self->queue.semi_transparent) * sizeof(BufferVertex);
+   void *verts = commandbuffer_allocate_vertex_data(cbh_get(&self->cmd), 0,
+         size + (append_floor ? 6 * sizeof(BufferVertex) : 0),
+         sizeof(BufferVertex), VK_VERTEX_INPUT_RATE_VERTEX);
    memcpy(verts, BufferVertexVec_data(&self->queue.semi_transparent), size);
+
+   /* Multipass off: one full-framebuffer quad at the tail of the vertex
+    * data, drawn with MAX blending after each fixed-function subtractive
+    * batch (renderer_emit_sub_floor). 96 bytes, appended only on the 16F
+    * target; depth is a don't-care because the floor pass disables the
+    * depth test. */
+   if (append_floor)
+   {
+      BufferVertex *fv = (BufferVertex *)verts + prims * 3;
+      unsigned fi;
+      memset(fv, 0, 6 * sizeof(BufferVertex));
+      fv[1].x = (float)FB_WIDTH;
+      fv[2].y = (float)FB_HEIGHT;
+      fv[3].x = (float)FB_WIDTH;
+      fv[3].y = (float)FB_HEIGHT;
+      fv[4] = fv[2];
+      fv[5] = fv[1];
+      for (fi = 0; fi < 6; fi++)
+      {
+         fv[fi].z = 0.5f;
+         fv[fi].w = 1.0f;
+      }
+   }
 
    last_state = *SemiTransparentStateVec_at(&self->queue.semi_transparent_state, 0);
 
@@ -9470,7 +9574,7 @@ static void renderer_render_semi_transparent_primitives(Renderer *self){
       /* If we need programmable shading, we can't batch as primitives may
        * overlap. We could in theory do some fancy tests here, but probably
        * overkill here. */
-      if ((last_state.masked && last_state.semi_transparent != SemiTransparentMode_None) ||
+      if (renderer_semi_trans_needs_feedback(self, &last_state) ||
           !semi_transparent_state_eq(&last_state, SemiTransparentStateVec_at(&self->queue.semi_transparent_state, i)))
       {
          unsigned to_draw = i - last_draw_offset;
@@ -9490,6 +9594,8 @@ static void renderer_render_semi_transparent_primitives(Renderer *self){
          commandbuffer_draw(cbh_get(&self->cmd), to_draw * 3, 1, last_draw_offset * 3, 0);
          if (self->msaa > 1)
             commandbuffer_set_multisample_state(cbh_get(&self->cmd), false, false, false);
+         if (renderer_semi_trans_batch_wants_sub_floor(self, &last_state))
+            renderer_emit_sub_floor(self, prims * 3);
          last_draw_offset = i;
 
          last_state = *SemiTransparentStateVec_at(&self->queue.semi_transparent_state, i);
@@ -9502,6 +9608,8 @@ static void renderer_render_semi_transparent_primitives(Renderer *self){
    commandbuffer_draw(cbh_get(&self->cmd), to_draw * 3, 1, last_draw_offset * 3, 0);
    if (self->msaa > 1)
       commandbuffer_set_multisample_state(cbh_get(&self->cmd), false, false, false);
+   if (renderer_semi_trans_batch_wants_sub_floor(self, &last_state))
+      renderer_emit_sub_floor(self, prims * 3);
    }
    }
 }
@@ -10041,7 +10149,15 @@ static void renderer_semi_transparent_set_state(Renderer *self,
    commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_Scaling, self->scaling);
    commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_Shift, state->shift);
    commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_OffsetUV, (int)state->offset_uv);
-   commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_HotSource, psx_hdr_overbright_hot);
+   /* Off the 16F target the UNORM write clamps anyway, so hot would only
+    * split pipelines for an identical result; force it off there. This is
+    * also what makes primitive.frag's hot path SDR-safe by construction. */
+   commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_HotSource,
+         (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? psx_hdr_overbright_hot : 0);
+   /* Only the feedback programs declare this; the pipeline hash masks it out
+    * everywhere else. 1 = check-mask (historical behaviour), 0 = the routed
+    * non-masked subtractive case. */
+   commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_MaskTest, state->masked ? 1 : 0);
 
    if (state->scissor_index < 0)
       commandbuffer_set_scissor(cbh_get(&self->cmd), &self->queue.default_scissor);
@@ -10060,6 +10176,10 @@ static void renderer_semi_transparent_set_state(Renderer *self,
       /* For opaque primitives which are just masked, we can make use of fixed function blending. */
       commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
       commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_Opaque);
+      /* primitive.frag now declares BLEND_MODE (hot-additive support) and the
+       * flush loop marks every spec slot dirty, so set it deterministically on
+       * the fixed-function branches too or stale values split pipelines. */
+      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAdd);
       commandbuffer_set_program(cbh_get(&self->cmd), textured);
       commandbuffer_set_blend_op(cbh_get(&self->cmd), VK_BLEND_OP_ADD, VK_BLEND_OP_ADD);
       commandbuffer_set_blend_factors(cbh_get(&self->cmd), VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
@@ -10087,6 +10207,7 @@ static void renderer_semi_transparent_set_state(Renderer *self,
       else
       {
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_SemiTrans);
+         commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAdd);
          commandbuffer_set_program(cbh_get(&self->cmd), textured);
          commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
          commandbuffer_set_blend_op(cbh_get(&self->cmd), VK_BLEND_OP_ADD, VK_BLEND_OP_ADD);
@@ -10117,6 +10238,7 @@ static void renderer_semi_transparent_set_state(Renderer *self,
       {
          static const float rgba[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_SemiTrans);
+         commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAvg);
          commandbuffer_set_program(cbh_get(&self->cmd), textured);
          commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
          commandbuffer_set_blend_constants(cbh_get(&self->cmd), rgba);
@@ -10128,7 +10250,12 @@ static void renderer_semi_transparent_set_state(Renderer *self,
    }
    case SemiTransparentMode_Sub:
    {
-      if (state->masked)
+      /* On the 16F HDR target, non-masked subtractive prims are also routed
+       * through the feedback program: it applies the floor-at-zero hardware
+       * semantics in-shader (fixed-function REVERSE_SUBTRACT cannot on a
+       * float attachment). MaskTest, set above from state->masked, keeps the
+       * check-mask discard off for the routed case. */
+      if (renderer_semi_trans_needs_feedback(self, state))
       {
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendSub);
          commandbuffer_set_program(cbh_get(&self->cmd), textured_masked);
@@ -10147,6 +10274,7 @@ static void renderer_semi_transparent_set_state(Renderer *self,
       else
       {
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_SemiTrans);
+         commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendSub);
          commandbuffer_set_program(cbh_get(&self->cmd), textured);
          commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
          commandbuffer_set_blend_op(cbh_get(&self->cmd), VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_ADD);
@@ -10177,6 +10305,7 @@ static void renderer_semi_transparent_set_state(Renderer *self,
       {
          static const float rgba[4] = { 0.25f, 0.25f, 0.25f, 1.0f };
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_SemiTrans);
+         commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAddQuarter);
          commandbuffer_set_program(cbh_get(&self->cmd), textured);
          commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
          commandbuffer_set_blend_constants(cbh_get(&self->cmd), rgba);

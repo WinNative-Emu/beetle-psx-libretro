@@ -25,6 +25,13 @@ layout(constant_id = 2) const int BLEND_MODE = BLEND_ADD;
 layout(constant_id = 6) const int HDR_HOT_SOURCE = 0;
 #endif
 
+/* Check-mask (dst alpha) test. This program originally existed only for
+ * mask-tested draws, so the test was unconditional. The 16F HDR target also
+ * routes non-masked subtractive prims through here - fixed-function
+ * REVERSE_SUBTRACT cannot floor at zero on a float attachment - and those
+ * must not check-mask. Set from SpecConstIndex_MaskTest. */
+layout(constant_id = 7) const int MASK_TEST = 1;
+
 void main()
 {
 #ifdef TEXTURED
@@ -51,7 +58,7 @@ void main()
 	vec4 fbcolor = subpassLoad(uFeedbackFramebuffer);
 #endif
 
-	if (fbcolor.a > 0.5)
+	if (MASK_TEST != 0 && fbcolor.a > 0.5)
 		discard;
 
 	vec3 blended;
@@ -60,7 +67,12 @@ void main()
 	if (BLEND_MODE == BLEND_AVG)
 		blended = mix(shaded, 0.5 * (clamp(shaded, 0.0, 1.0) + fbcolor.rgb), blend_amt);
 	if (BLEND_MODE == BLEND_SUB)
-		blended = mix(shaded, fbcolor.rgb - add_src, blend_amt);
+		/* Hardware floors B - F at zero per channel. The UNORM attachment
+		 * used to provide that implicitly at the write stage; the 16F HDR
+		 * target does not, and a negative residue both diverges from
+		 * hardware and dims every later additive draw over the same pixels
+		 * (dark halos around subtractive effects). No-op on UNORM. */
+		blended = mix(shaded, max(fbcolor.rgb - add_src, vec3(0.0)), blend_amt);
 	if (BLEND_MODE == BLEND_ADD_QUARTER)
 		blended = mix(shaded, clamp(shaded, 0.0, 1.0) * 0.25 + fbcolor.rgb, blend_amt);
 

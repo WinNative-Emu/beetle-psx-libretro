@@ -22,6 +22,40 @@
 #include "tt_trace.h"
 #include "beetle_psx_globals.h"
 
+/* HDR output state, owned by libretro.c (same contract as the Vulkan
+ * renderer's extern block). psx_color_format records the *requested*
+ * color format; psx_hdr_active is true only once the frontend accepted
+ * SET_PIXEL_FORMAT(HDR10_2101010), so the display encode gates on the
+ * latter while the fp16 render target gates on the former (it is
+ * allocated before negotiation completes). */
+extern int   psx_color_format;
+extern bool  psx_hdr_active;
+extern float psx_hdr_paper_white_nits;
+extern float psx_hdr_max_nits;
+extern int   psx_hdr_expand_gamut;
+extern int   psx_hdr_shoulder;
+extern int   psx_hdr_sdr_eotf;
+extern int   psx_hdr_overbright_hot;
+extern int   psx_src_primaries;
+
+/* fp16 render targets are core on desktop GL 3.0+; GLES3 needs an
+ * extension to make them color-renderable. When unavailable, fb_out
+ * stays on its SDR storage: the PQ display encode still runs if the
+ * frontend engaged HDR10 (the signal contract requires it), but
+ * over-white content clamps at reference white. */
+static bool gl_fp16_renderable(void)
+{
+#ifdef HAVE_OPENGLES3
+   const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+   if (!ext)
+      return false;
+   return strstr(ext, "GL_EXT_color_buffer_float") != NULL ||
+          strstr(ext, "GL_EXT_color_buffer_half_float") != NULL;
+#else
+   return true;
+#endif
+}
+
 #define gl_draw_buffer_is_empty(x)           ((x)->map_index == 0)
 #define gl_draw_buffer_remaining_capacity(x) ((x)->capacity - (x)->map_index)
 #define gl_draw_buffer_next_index(x)         ((x)->map_start + (x)->map_index)
@@ -717,6 +751,10 @@ struct gl_renderer {
    uint32_t internal_upscaling;
    /* Current internal color depth */
    uint8_t internal_color_depth;
+   /* fb_out is GL_RGBA16F: 30-bit/HDR color format requested and fp16 is
+    * color-renderable. Drives the explicit source clamp, the subtractive
+    * zero-floor pass, dither force-off, and readback quantisation. */
+   bool fb_out_fp16;
    /* Counter for preserving primitive draw order in the z-buffer
     * since we draw semi-transparent primitives out-of-order. */
    int16_t primitive_ordering;
@@ -1470,31 +1508,68 @@ static void gl_texture_set_sub_image_window(
    uint16_t x         = top_left[0];
    uint16_t y         = top_left[1];
 
-   /* `data` is the caller's full 1024x512 VRAM buffer.  `index`
-    * picks the first pixel of the upload region.  With x < 1024
-    * and y < 512 (both clamped at the GP0 FBWrite parser via
-    * x &= 0x3FF, y &= 0x1FF, see gpu.cpp), index is at most
-    * 511*1024 + 1023 == 524287, the last element of vram.
-    *
-    * glTexSubImage2D below then reads (resolution[1]-1) * row_len
-    * + resolution[0] words past sub_data using GL_UNPACK_ROW_LENGTH.
-    * If x + resolution[0] > 1024 or y + resolution[1] > 512 the
-    * upload reads past the end of vram - i.e. an FBWrite whose
-    * target rectangle wraps across the VRAM seam.  The PS1 GPU
-    * wraps such writes (the SW renderer's texel_put does
-    * curx & 1023, cury & 511); this GL fast-path does not, and
-    * the corresponding upload is incorrect for wrap-across writes.
-    *
-    * This is a pre-existing limitation, not introduced by this
-    * function.  Fixing it would require splitting the upload
-    * into 1-4 glTexSubImage2D calls along the seam(s), or
-    * pre-rotating the source data into a scratch buffer. */
+   /* Callers split wrap-around VRAM transfers at the 1024x512 seams,
+    * so this function always receives a contiguous source and a
+    * destination rectangle contained within the texture. */
    size_t index       = ((size_t) y) * row_len + ((size_t) x);
    uint16_t* sub_data = &( data[index] );
 
    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint) row_len);
    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
    glBindTexture(GL_TEXTURE_2D, tex->id);
+
+#ifdef HAVE_OPENGLES3
+   /*
+    * PS1 VRAM stores 16-bit ABGR1555 words. OpenGL ES lacks
+    * GL_UNSIGNED_SHORT_1_5_5_5_REV, so convert them to the RGBA5551
+    * layout required by GL_UNSIGNED_SHORT_5_5_5_1. Display mode
+    * affects scanout interpretation, not the underlying VRAM layout.
+    */
+   if (ty == GL_UNSIGNED_SHORT_5_5_5_1)
+   {
+      size_t sub_w = (size_t) resolution[0];
+      size_t sub_h = (size_t) resolution[1];
+      uint16_t* converted =
+            (uint16_t*) malloc(sub_w * sub_h * sizeof(uint16_t));
+
+      if (!converted)
+      {
+         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+         return;
+      }
+
+      for (size_t line = 0; line < sub_h; line++)
+      {
+         const uint16_t* src_row = sub_data + line * row_len;
+         uint16_t* dst_row = converted + line * sub_w;
+
+         for (size_t px = 0; px < sub_w; px++)
+         {
+            uint16_t val = src_row[px];
+            uint16_t r = val & 0x1Fu;
+            uint16_t g = (val >> 5) & 0x1Fu;
+            uint16_t b = (val >> 10) & 0x1Fu;
+            uint16_t a = (val >> 15) & 0x01u;
+
+            dst_row[px] = (r << 11) | (g << 6) | (b << 1) | a;
+         }
+      }
+
+      glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+      glTexSubImage2D(  GL_TEXTURE_2D,
+                        0,
+                        (GLint) top_left[0],
+                        (GLint) top_left[1],
+                        (GLsizei) resolution[0],
+                        (GLsizei) resolution[1],
+                        format,
+                        ty,
+                        (void*)converted);
+      free(converted);
+      return;
+   }
+#endif
+
    glTexSubImage2D(  GL_TEXTURE_2D,
                      0,
                      (GLint) top_left[0],
@@ -1995,6 +2070,12 @@ static void gl_renderer_draw(gl_renderer *renderer)
       {
          glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "draw_semi_transparent"), !opaque);
          glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "force_mask_bit"), it->force_mask ? 1u : 0u);
+         /* "HDR Additive Overbright": skip the source clamp for plain
+          * additive draws on the fp16 target only, matching the Vulkan
+          * renderer (primitive.frag gates hot on BLEND_ADD). */
+         glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "hdr_hot"),
+               (renderer->fb_out_fp16 && psx_hdr_overbright_hot && !it->opaque &&
+                it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD) ? 1u : 0u);
       }
       if (opaque)
          glDisable(GL_BLEND);
@@ -2074,6 +2155,31 @@ static void gl_renderer_draw(gl_renderer *renderer)
           * draw calls between the prepare/finalize) */
          glDrawElements(it->draw_mode, it->count, GL_UNSIGNED_SHORT,
                         (GLvoid*)(it->first * sizeof(GLushort)));
+
+         /* Zero-floor pass for subtractive blending on the fp16 target.
+          * GL_FUNC_REVERSE_SUBTRACT clamps at zero on a UNORM attachment
+          * but not on GL_RGBA16F; hardware floors B - F at 0 per channel.
+          * Redraw the same geometry with blend equation MAX and the
+          * shader forced to emit vec4(0): max(dst, 0) after a contiguous
+          * subtractive run is algebraically identical to hardware's
+          * per-primitive floor (once the running value would clamp,
+          * every further subtraction keeps both forms at zero). Depth is
+          * LEQUAL so the redraw passes against its own depth writes;
+          * alpha (the mask bit) is preserved via ZERO/ONE ADD; stencil
+          * writes are masked off so set_mask state cannot double-apply. */
+         if (renderer->fb_out_fp16 && !it->opaque &&
+             it->transparency_mode == SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE &&
+             renderer->command_buffer->program)
+         {
+            glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "force_zero"), 1u);
+            glBlendEquationSeparate(GL_MAX, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+            glStencilMask(0);
+            glDrawElements(it->draw_mode, it->count, GL_UNSIGNED_SHORT,
+                           (GLvoid*)(it->first * sizeof(GLushort)));
+            glStencilMask(1);
+            glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "force_zero"), 0u);
+         }
       }
 
          if (hd_owned)
@@ -2118,29 +2224,18 @@ static void gl_renderer_upload_textures(
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);
 
-   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
-   glTexSubImage2D(  GL_TEXTURE_2D,
-         0,
-         (GLint) top_left[0],
-         (GLint) top_left[1],
-         (GLsizei) dimensions[0],
-         (GLsizei) dimensions[1],
+   gl_texture_set_sub_image_window(
+         &renderer->fb_texture,
+         top_left,
+         dimensions,
+         (size_t) VRAM_WIDTH_PIXELS,
          GL_RGBA,
 #ifdef HAVE_OPENGLES3
          GL_UNSIGNED_SHORT_5_5_5_1,
-         /* bits are always in the order that they show
-          * REV indicates the channels are in reversed order
-          * RGBA
-          * 16 bit unsigned short: R5 G5 B5 A1
-          * RRRRRGGGGGBBBBBA */
 #else
          GL_UNSIGNED_SHORT_1_5_5_5_REV,
-         /* ABGR
-          * 16 bit unsigned short: A1 B5 G5 R5
-          * ABBBBBGGGGGRRRRR */
 #endif
-         (void*)pixel_buffer);
+         pixel_buffer);
 
    x_start    = top_left[0];
    x_end      = x_start + dimensions[0];
@@ -2450,10 +2545,14 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
     * textures. */
    gl_texture_init(&renderer->fb_texture, native_width, native_height, GL_RGB5_A1);
 
-   if (dither_mode == DITHER_OFF)
+   renderer->fb_out_fp16 = psx_color_format != 0 && gl_fp16_renderable();
+
+   if (dither_mode == DITHER_OFF || renderer->fb_out_fp16)
    {
       /* Dithering is superfluous when we increase the internal
-      * color depth, but users asked for it */
+      * color depth, but users asked for it. On the fp16 HDR target it is
+      * force-disabled, matching the Vulkan renderer: the wide target
+      * carries the full precision the dither exists to fake. */
       gl_draw_buffer_disable_attribute(command_buffer, "dither");
    }
    else
@@ -2481,6 +2580,12 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
          log_cb(RETRO_LOG_ERROR, "Unsupported depth %d\n", depth);
          exit(EXIT_FAILURE);
    }
+
+   /* The HDR scaled framebuffer overrides the Internal Color Depth
+    * choice: additive overshoot and the subtractive floor need a wide
+    * float target, exactly like the Vulkan renderer's 16F path. */
+   if (renderer->fb_out_fp16)
+      texture_storage = GL_RGBA16F;
 
    gl_texture_init(
          &renderer->fb_out,
@@ -2965,12 +3070,14 @@ static bool retro_refresh_variables(gl_renderer *renderer)
       if (!strcmp(var.value, "1x(native)"))
       {
          dither_mode = DITHER_NATIVE;
-         gl_draw_buffer_enable_attribute(renderer->command_buffer, "dither");
+         if (!renderer->fb_out_fp16)
+            gl_draw_buffer_enable_attribute(renderer->command_buffer, "dither");
       }
       else if (!strcmp(var.value, "internal resolution"))
       {
          dither_mode = DITHER_UPSCALED;
-         gl_draw_buffer_enable_attribute(renderer->command_buffer, "dither");
+         if (!renderer->fb_out_fp16)
+            gl_draw_buffer_enable_attribute(renderer->command_buffer, "dither");
       }
       else if (!strcmp(var.value, "disabled"))
       {
@@ -2993,7 +3100,7 @@ static bool retro_refresh_variables(gl_renderer *renderer)
       uint16_t top_left[2]   = {0, 0};
       uint16_t dimensions[2] = {(uint16_t) VRAM_WIDTH_PIXELS, (uint16_t) VRAM_HEIGHT};
 
-      if (dither_mode == DITHER_OFF)
+      if (dither_mode == DITHER_OFF || renderer->fb_out_fp16)
          gl_draw_buffer_disable_attribute(renderer->command_buffer, "dither");
       else
          gl_draw_buffer_enable_attribute(renderer->command_buffer, "dither");
@@ -3010,6 +3117,11 @@ static bool retro_refresh_variables(gl_renderer *renderer)
             log_cb(RETRO_LOG_ERROR, "Unsupported depth %d\n", depth);
             exit(EXIT_FAILURE);
       }
+
+      /* See the initial allocation: HDR pins the storage to fp16
+       * regardless of the Internal Color Depth setting. */
+      if (renderer->fb_out_fp16)
+         texture_storage = GL_RGBA16F;
 
       glDeleteTextures(1, &renderer->fb_out.id);
       renderer->fb_out.id     = 0;
@@ -4229,6 +4341,19 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
                glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "depth_24bpp"), depth_24bpp);
 
                glUniform1ui(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "internal_upscaling"), renderer->internal_upscaling);
+
+               /* HDR10 output encode parameters. hdr_active follows the
+                * negotiated pixel format, not fb_out_fp16: once the
+                * frontend accepted HDR10_2101010, the presented image
+                * must be PQ Rec.2020 - a non-fp16 fallback merely means
+                * over-white content clamps at reference white. */
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_active"), psx_hdr_active ? 1 : 0);
+               glUniform1f(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_paper_white"), psx_hdr_paper_white_nits);
+               glUniform1f(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_max_nits"), psx_hdr_max_nits);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_expand_gamut"), psx_hdr_expand_gamut);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_shoulder"), psx_hdr_shoulder);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_sdr_eotf"), psx_hdr_sdr_eotf);
+               glUniform1i(gl_uniform_map_get(&renderer->output_buffer->program->uniforms, "hdr_src_primaries"), psx_src_primaries);
             }
 
             if (!gl_draw_buffer_is_empty(renderer->output_buffer))
@@ -4845,6 +4970,8 @@ void rhi_gl_load_image(
    if (static_renderer.state == GL_STATE_INVALID)
       return;
 
+   x &= VRAM_WIDTH_PIXELS - 1;
+   y &= VRAM_HEIGHT - 1;
    renderer = static_renderer.state_data;
    if (!renderer)
    {
@@ -4859,6 +4986,42 @@ void rhi_gl_load_image(
        * which lives for the whole core lifetime - safe to hold. */
       rhi_defer_push_load_image(&gl_defer_queue,
             x, y, w, h, vram, mask_test, set_mask);
+      return;
+   }
+
+   if ((unsigned)x + w > VRAM_WIDTH_PIXELS ||
+       (unsigned)y + h > VRAM_HEIGHT)
+   {
+      uint16_t widths[2];
+      uint16_t heights[2];
+      unsigned x_parts;
+      unsigned y_parts;
+      unsigned yi;
+      unsigned xi;
+
+      widths[0] = w < (uint16_t)(VRAM_WIDTH_PIXELS - x)
+            ? w : (uint16_t)(VRAM_WIDTH_PIXELS - x);
+      widths[1] = (uint16_t)(w - widths[0]);
+      heights[0] = h < (uint16_t)(VRAM_HEIGHT - y)
+            ? h : (uint16_t)(VRAM_HEIGHT - y);
+      heights[1] = (uint16_t)(h - heights[0]);
+      x_parts = widths[1] ? 2 : 1;
+      y_parts = heights[1] ? 2 : 1;
+
+      for (yi = 0; yi < y_parts; yi++)
+      {
+         for (xi = 0; xi < x_parts; xi++)
+         {
+            rhi_gl_load_image(
+                  xi ? 0 : x,
+                  yi ? 0 : y,
+                  widths[xi],
+                  heights[yi],
+                  vram,
+                  mask_test,
+                  set_mask);
+         }
+      }
       return;
    }
 
@@ -5019,6 +5182,12 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
       return true;
 
    is_32bpp = (renderer->internal_color_depth == 32);
+   /* The fp16 HDR target reads back through the 16bpp path: every GL
+    * conversion to 1555 / RGB5_A1 clamps to [0,1] first and quantises
+    * straight to 5 bits, which is the hardware FBRead behaviour. The
+    * RGBA8 intermediate would round to 8 bits before truncating to 5. */
+   if (renderer->fb_out_fp16)
+      is_32bpp = false;
    upscale  = renderer->internal_upscaling;
    if (upscale == 0)
       upscale = 1;

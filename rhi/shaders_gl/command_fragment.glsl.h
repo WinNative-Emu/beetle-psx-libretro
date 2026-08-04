@@ -21,6 +21,16 @@ uniform sampler2D fb_texture;
 
 // Scaling to apply to the dither pattern
 uniform uint dither_scaling;
+// HDR fp16 target only. 0: saturate the modulated texture source to 1.0
+// before blending (hardware behaviour; the UNORM targets do this at the
+// write stage for free). 1: leave it hot for over-white single-layer
+// additive glow ("HDR Additive Overbright"; the renderer sets this for
+// plain additive draws only).
+uniform uint hdr_hot;
+// When 1, emit vec4(0.0) unconditionally: used by the zero-floor pass
+// that follows each subtractive batch on the fp16 target (blend
+// equation MAX against zero restores the hardware floor).
+uniform uint force_zero;
 
 // 0: Only draw opaque pixels, 1: only draw semi-transparent pixels
 uniform uint draw_semi_transparent;
@@ -87,15 +97,9 @@ uint rebuild_psx_color(vec4 color) {
   uint b = uint(floor(color.b * 31. + 0.5));
 
 )
-#ifdef HAVE_OPENGLES3
-STRINGIZE(
-  return (r << 11) | (g << 6) | (b << 1) | a;
-)
-#else
 STRINGIZE(
   return (a << 15) | (b << 10) | (g << 5) | r;
 )
-#endif
 STRINGIZE(
 }
 
@@ -108,6 +112,15 @@ bool is_transparent(vec4 texel) {
 }
 
 // reinterpret 5551 color for GLES (doesn't support 1555 REV)
+)
+#ifdef HAVE_OPENGLES3
+STRINGIZE(
+vec4 reinterpret_color(vec4 color) {
+  return color;
+}
+)
+#else
+STRINGIZE(
 vec4 reinterpret_color(vec4 color) {
   // rebuild as 5551
   uint pre_bits = rebuild_psx_color(color);
@@ -120,6 +133,9 @@ vec4 reinterpret_color(vec4 color) {
 
   return vec4(r, g, b, a);
 }
+)
+#endif
+STRINGIZE(
 
 // ---- HD texture replacement sampling ----
 // Port of rhi/shaders_vulkan/hdtextures.h onto this shader's varyings:
@@ -974,6 +990,11 @@ vec4 get_texel_jinc2(out float opacity)
 #endif
 STRINGIZE(
 void main() {
+   if (force_zero != 0u) {
+      frag_color = vec4(0.);
+      return;
+   }
+
    vec4 color;
    float opacity=1.;
    
@@ -1073,12 +1094,17 @@ STRINGIZE(
          } else /* BLEND_MODE_TEXTURE_BLEND */ {
             // Blend the texel with the shading color. `frag_shading_color`
             // is multiplied by two so that it can be used to darken or
-            // lighten the texture as needed. The result of the
-            // multiplication should be saturated to 1.0 (0xff) but I think
-            // OpenGL will take care of that since the output buffer holds
-            // integers.
+            // lighten the texture as needed.
             color = vec4(frag_shading_color * 2. * texel.rgb, mask_bit);
          }
+
+         // Saturate the modulated source to 1.0. The old comment here
+         // relied on the UNORM framebuffer clamping at the write stage
+         // ("I think OpenGL will take care of that"), which GL_RGBA16F
+         // does not do. No-op on the UNORM targets; hdr_hot skips it for
+         // over-white additive sources on the fp16 target.
+         if (hdr_hot == 0u)
+            color.rgb = min(color.rgb, vec3(1.));
       }
 
    // 4x4 dithering pattern scaled by `dither_scaling`
