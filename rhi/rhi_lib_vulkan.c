@@ -4101,7 +4101,13 @@ static void command_pool_signal_submitted(CommandPool *self,
       unsigned alpha_blend_op : BLEND_OP_BITS;
       unsigned topology : 4;
 
-      unsigned spec_constant_mask : 8;
+      /* Must hold one bit per declarable constant. This was still 8 wide
+       * after VULKAN_NUM_SPEC_CONSTANTS grew to 10, so bits 8 and 9
+       * (PreciseColor, PgxpFog) could never enter the pipeline hash or the
+       * VkSpecializationInfo map: every pipeline built through this state
+       * compiled those constants at their SPIR-V defaults regardless of
+       * what was set. */
+      unsigned spec_constant_mask : VULKAN_NUM_SPEC_CONSTANTS;
    };
 
    union PipelineState {
@@ -4420,7 +4426,9 @@ static void command_pool_signal_submitted(CommandPool *self,
    static INLINE void commandbuffer_set_specialization_constant_mask(struct CommandBuffer *self,
          uint32_t spec_constant_mask)
    {
-      VK_ASSERT((spec_constant_mask & ~((1u << VULKAN_NUM_SPEC_CONSTANTS) - 1u)) == 0u);
+      /* Callers pass -1u for "every constant the program declares"; keep
+       * that contract by normalising here instead of asserting on it. */
+      spec_constant_mask &= (1u << VULKAN_NUM_SPEC_CONSTANTS) - 1u;
       SET_STATIC_STATE(spec_constant_mask);
    }
    static INLINE void commandbuffer_set_specialization_constant(struct CommandBuffer *self,
@@ -6000,6 +6008,9 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS);
       commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_SemiTransOpaque);
       commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_Scaling, self->scaling);
+      /* Same omission and same fix as the opaque textured drain below. */
+      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
+            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
       commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
@@ -6007,7 +6018,6 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 3, 0, VK_FORMAT_R16G16B16A16_SINT, offsetof(BufferVertex, pal_x));
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 4, 0, VK_FORMAT_R16G16B16A16_SINT, offsetof(BufferVertex, u));
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 5, 0, VK_FORMAT_R16G16B16A16_UINT, offsetof(BufferVertex, min_u));
-   commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, fog));
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, fog));
 
       renderer_dispatch(self, vertices, scissors, true);
@@ -6025,6 +6035,14 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_Opaque);
       commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_Scaling, self->scaling);
       commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+      /* The linear-light depth-cue constant was set only in
+       * renderer_semi_transparent_set_state, so every opaque pipeline
+       * compiled with the fog mix off while the CPU side had already
+       * substituted pre-cue precise colours: the opaque world rendered
+       * with no fog at all under 30-bit HDR. Same expression as the
+       * semi-transparent site. */
+      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
+            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 2, 0, VK_FORMAT_R8G8B8A8_UINT, offsetof(BufferVertex, window));
@@ -8662,7 +8680,17 @@ static void renderer_hazard(Renderer *self, StatusFlags flags)
       renderer_flush_resolves(self);
    }
 
-   VK_ASSERT(src_stages);
+   /* srcStageMask == 0 is illegal without synchronization2
+    * (VUID-vkCmdPipelineBarrier-srcStageMask-03937). It happens when the
+    * flag set names no prior producer -- observed on a clean 30-bit HDR
+    * boot via tools/vkhost with the Khronos validation layer, which is
+    * also how the debug assert below evidently never fired in anyone's
+    * release build. TOP_OF_PIPE is the spec's spelling of "wait on
+    * nothing": correct semantics for a hazard with no producer, and no
+    * longer invalid usage that stricter drivers may answer with a
+    * device loss. */
+   if (!src_stages)
+      src_stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
    VK_ASSERT(dst_stages);
    renderer_ensure_command_buffer(self);
    commandbuffer_barrier_simple(cbh_get(&self->cmd), src_stages, src_access, dst_stages, dst_access);
@@ -9581,6 +9609,12 @@ static void renderer_render_opaque_primitives(Renderer *self){
    commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS);
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
+   commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, fog));
+   /* Same omission and same fix as the textured drains: without the
+    * constant the flat pipeline compiled with the fog mix off and drew
+    * the pre-cue colour raw. */
+   commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
+         (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
    commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
    renderer_dispatch(self, vertices, scissors, false);
@@ -9688,6 +9722,7 @@ static void renderer_render_semi_transparent_primitives(Renderer *self){
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 3, 0, VK_FORMAT_R16G16B16A16_SINT, offsetof(BufferVertex, pal_x));
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 4, 0, VK_FORMAT_R16G16B16A16_SINT, offsetof(BufferVertex, u));
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 5, 0, VK_FORMAT_R16G16B16A16_UINT, offsetof(BufferVertex, min_u));
+   commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, fog));
 
    { bool append_floor = self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT &&
          !psx_hdr_multipass;
@@ -15322,7 +15357,14 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
 
       /* Enable device features we might care about. */
       {
-         VkPhysicalDeviceFeatures enabled_features = *required_features;
+         /* The negotiation contract lets a frontend pass NULL for "no
+          * required features"; RetroArch always passes a zeroed struct, so
+          * this dereference survived until a frontend that did not. */
+         VkPhysicalDeviceFeatures enabled_features;
+         if (required_features)
+            enabled_features = *required_features;
+         else
+            memset(&enabled_features, 0, sizeof(enabled_features));
          if (features.features.textureCompressionETC2)
             enabled_features.textureCompressionETC2 = VK_TRUE;
          if (features.features.textureCompressionBC)
@@ -19500,6 +19542,46 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
    vulkan->set_image(vulkan->handle, image, 0,
          NULL, VK_QUEUE_FAMILY_IGNORED);
    renderer_flush(renderer);
+
+   /* VKHOST_CORE_DUMP: readback through the core's own machinery. */
+   if (getenv("VKHOST_CORE_DUMP"))
+   {
+      static int dump_n;
+      if (++dump_n == 100)
+      {
+         unsigned w = image_get_width(ih_get(&scanout), 0);
+         unsigned h = image_get_height(ih_get(&scanout), 0);
+         BufferCreateInfo bi;
+         BufferHandle buf;
+         CommandBufferHandle c;
+         memset(&bi, 0, sizeof(bi));
+         bi.size   = (VkDeviceSize)w * h * 8;
+         bi.domain  = BufferDomain_CachedHost;
+         bi.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+         buf = device_create_buffer(renderer->device, &bi, NULL);
+         c = device_request_command_buffer(renderer->device, Type_Generic);
+         { VkOffset3D o = { 0, 0, 0 };
+           VkExtent3D e = { w, h, 1 };
+           commandbuffer_image_barrier(cbh_get(&c), ih_get(&scanout),
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+           { VkImageSubresourceLayers sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+             commandbuffer_copy_image_to_buffer(cbh_get(&c), bh_get(&buf), ih_get(&scanout), 0, &o, &e, 0, 0, &sub); }
+           commandbuffer_image_barrier(cbh_get(&c), ih_get(&scanout),
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT); }
+         device_submit(renderer->device, &c, NULL, 0, NULL);
+         device_wait_idle_nolock(renderer->device);
+         { void *m = device_map_host_buffer(renderer->device, bh_get(&buf), MEMORY_ACCESS_READ_BIT);
+           FILE *f = fopen("/tmp/core_scanout.raw", "wb");
+           if (f && m) { fwrite(m, 1, (size_t)w * h * 8, f); fclose(f); }
+           if (m) device_unmap_host_buffer(renderer->device, bh_get(&buf), MEMORY_ACCESS_READ_BIT);
+           fprintf(stderr, "[core-dump] wrote /tmp/core_scanout.raw %ux%u\n", w, h); }
+         bh_reset(&buf);
+      }
+   }
 
    ih_assign(&scanout_handles.items[index], &scanout);
    video_refresh_cb(RETRO_HW_FRAME_BUFFER_VALID, image_get_width(ih_get(&scanout), 0), image_get_height(ih_get(&scanout), 0), 0);

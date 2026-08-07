@@ -66,8 +66,90 @@ static bool gl_fp16_renderable(void)
 #define gl_draw_buffer_next_index(x)         ((x)->map_start + (x)->map_index)
 
 #ifndef GL_MAP_INVALIDATE_RANGE_BIT
-#define GL_MAP_INVALIDATE_RANGE_BIT       0x000
+#define GL_MAP_INVALIDATE_RANGE_BIT       0x0004
 #endif
+#ifndef GL_PIXEL_PACK_BUFFER
+#define GL_PIXEL_PACK_BUFFER              0x88EB
+#endif
+#ifndef GL_PIXEL_UNPACK_BUFFER
+#define GL_PIXEL_UNPACK_BUFFER            0x88EC
+#endif
+#ifndef GL_UNPACK_SKIP_ROWS
+#define GL_UNPACK_SKIP_ROWS               0x0CF3
+#endif
+#ifndef GL_UNPACK_SKIP_PIXELS
+#define GL_UNPACK_SKIP_PIXELS             0x0CF4
+#endif
+#ifndef GL_PACK_SKIP_ROWS
+#define GL_PACK_SKIP_ROWS                 0x0D03
+#endif
+#ifndef GL_PACK_SKIP_PIXELS
+#define GL_PACK_SKIP_PIXELS               0x0D04
+#endif
+#ifndef GL_MAP_INVALIDATE_BUFFER_BIT
+#define GL_MAP_INVALIDATE_BUFFER_BIT      0x0008
+#endif
+
+/* Field diagnostics, enabled by setting BEETLE_GL_DIAG in the
+ * environment. Zero-cost when unset (one getenv on first use). Exists
+ * because a class of report - GL-only, NVIDIA-only, runahead-triggered
+ * corruption - reproduces on end-user machines but not on Mesa, where
+ * every map is serviced synchronously; when that happens the user's
+ * log, not our rig, is the instrument. */
+static int gl_diag_state = -1;
+static unsigned gl_diag_logged;
+static unsigned gl_diag_wraps;
+#define GL_DIAG_ON() (gl_diag_state >= 0 ? gl_diag_state : \
+      (gl_diag_state = (getenv("BEETLE_GL_DIAG") ? 1 : 0)))
+static void gl_diag_errors(const char *site)
+{
+   GLenum e;
+   if (!GL_DIAG_ON())
+      return;
+   while ((e = glGetError()) != GL_NO_ERROR)
+   {
+      if (gl_diag_logged < 64 && log_cb)
+      {
+         gl_diag_logged++;
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_diag] GL error 0x%04X at %s (report #%u)\n",
+               (unsigned)e, site, gl_diag_logged);
+      }
+   }
+}
+
+/* Normalise the pixel-transfer state this renderer inherits from the
+ * frontend. The glsm shim used to reset all of this around every core
+ * entry; the rhi port dropped the shim for its unused state mirror and
+ * with it, silently, the incoming-state normalisation that was doing
+ * real work. RetroArch legitimately uploads its own UI textures between
+ * retro_run calls (the statistics overlay does so every frame) and can
+ * leave GL_UNPACK_* skips/lengths set and a pixel buffer bound. A bound
+ * GL_PIXEL_UNPACK_BUFFER turns every client-pointer glTexSubImage into
+ * an offset into the frontend's buffer - out of bounds, the whole
+ * upload is dropped with GL_INVALID_OPERATION; in bounds, it uploads
+ * the frontend's bytes. Under Preemptive Frames runahead the savestate
+ * restore replays the full 1MiB VRAM image through exactly that path
+ * every frame, which turned this latent inheritance into constant
+ * whole-VRAM corruption on the GL renderer, while Vulkan - with no
+ * shared mutable transfer state - was immune. Called at every entry
+ * point that touches the context after the frontend may have. */
+static void gl_normalize_inherited_state(void)
+{
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   glPixelStorei(GL_UNPACK_ALIGNMENT,   4);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH,  0);
+   glPixelStorei(GL_UNPACK_SKIP_ROWS,   0);
+   glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+   glPixelStorei(GL_PACK_ALIGNMENT,     4);
+#ifdef GL_PACK_ROW_LENGTH
+   glPixelStorei(GL_PACK_ROW_LENGTH,    0);
+#endif
+   glPixelStorei(GL_PACK_SKIP_ROWS,     0);
+   glPixelStorei(GL_PACK_SKIP_PIXELS,   0);
+   glActiveTexture(GL_TEXTURE0);
+}
 
 #include "shaders_gl/command_vertex.glsl.h"
 #include "shaders_gl/command_fragment.glsl.h"
@@ -1176,20 +1258,42 @@ static void gl_draw_buffer_disable_attribute(gl_draw_buffer *drawbuffer, const c
  * each from 'slice' into the mapped buffer.  The map is typed
  * void* (was T* in the templated version) so we cast to char*
  * for byte arithmetic. */
+/* The NULL-map guard pairs with the release-build map-failure handling
+ * in gl_draw_buffer_map_no_bind: a failed map logs loudly once, and
+ * every push until the next successful map becomes a no-op instead of
+ * a memcpy through NULL. */
 #ifdef DEBUG
 #define gl_draw_buffer_push_slice(drawbuffer, slice, n, len) \
-   assert((n) <= gl_draw_buffer_remaining_capacity(drawbuffer)); \
-   assert((drawbuffer)->map != NULL); \
-   memcpy((char *)(drawbuffer)->map + (drawbuffer)->map_index * (len), (slice), (n) * (len)); \
-   (drawbuffer)->map_index += (n);
+   do { \
+      assert((n) <= gl_draw_buffer_remaining_capacity(drawbuffer)); \
+      assert((drawbuffer)->map != NULL); \
+      if ((drawbuffer)->map) \
+      { \
+         memcpy((char *)(drawbuffer)->map + (drawbuffer)->map_index * (len), (slice), (n) * (len)); \
+         (drawbuffer)->map_index += (n); \
+      } \
+   } while (0)
 #else
 #define gl_draw_buffer_push_slice(drawbuffer, slice, n, len) \
-   memcpy((char *)(drawbuffer)->map + (drawbuffer)->map_index * (len), (slice), (n) * (len)); \
-   (drawbuffer)->map_index += (n);
+   do { \
+      if ((drawbuffer)->map) \
+      { \
+         memcpy((char *)(drawbuffer)->map + (drawbuffer)->map_index * (len), (slice), (n) * (len)); \
+         (drawbuffer)->map_index += (n); \
+      } \
+   } while (0)
 #endif
 
 static void gl_draw_buffer_draw(gl_draw_buffer *drawbuffer, GLenum mode)
 {
+   if (!drawbuffer->map)
+   {
+      /* A previous map failed; nothing was pushed. Reset and retry the
+       * map rather than unmapping a buffer that is not mapped. */
+      drawbuffer->map_index = 0;
+      gl_draw_buffer_map_no_bind(drawbuffer);
+      return;
+   }
    glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
    /* Unmap the active buffer */
    glUnmapBuffer(GL_ARRAY_BUFFER);
@@ -1217,6 +1321,7 @@ static void gl_draw_buffer_map_no_bind(gl_draw_buffer *drawbuffer)
    void *m                = NULL;
    size_t element_size    = drawbuffer->element_size;
    GLsizeiptr buffer_size = drawbuffer->capacity * element_size;
+   GLbitfield map_flags   = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT;
 
    glBindBuffer(GL_ARRAY_BUFFER, drawbuffer->id);
 
@@ -1226,17 +1331,49 @@ static void gl_draw_buffer_map_no_bind(gl_draw_buffer *drawbuffer)
    /* We don't have enough room left to remap 'capacity',
     * start back from the beginning of the buffer. */
    if (drawbuffer->map_start > 2 * drawbuffer->capacity)
+   {
       drawbuffer->map_start = 0;
+      /* At the wrap the mapped window lands back on vertex data whose
+       * draws may still be in flight on a deeply pipelined driver. A
+       * non-UNSYNCHRONIZED map is required to be safe there - the
+       * implementation must either wait for the pending reads or
+       * rename the range - so on a conforming driver this is a stall,
+       * not a hazard. Orphan the whole buffer instead: the driver
+       * hands back fresh storage while pending draws keep the old one,
+       * removing both the stall and any reliance on the driver getting
+       * the overlap of INVALIDATE_RANGE with in-flight reads right. */
+      map_flags = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT;
+      if (GL_DIAG_ON())
+      {
+         gl_diag_wraps++;
+         if (log_cb && (gl_diag_wraps <= 4 || (gl_diag_wraps & 0x3FFu) == 0))
+            log_cb(RETRO_LOG_INFO,
+                  "[gl_diag] draw buffer wrap #%u (capacity %u, esz %u): orphaning\n",
+                  gl_diag_wraps, (unsigned)drawbuffer->capacity,
+                  (unsigned)element_size);
+      }
+   }
 
    offset_bytes = drawbuffer->map_start * element_size;
 
    m = glMapBufferRange(GL_ARRAY_BUFFER,
          offset_bytes,
          buffer_size,
-         GL_MAP_WRITE_BIT |
-         GL_MAP_INVALIDATE_RANGE_BIT);
+         map_flags);
 
-   assert(m != NULL);
+   /* assert() vanishes under NDEBUG, and a NULL map used to flow
+    * straight into the push-slice memcpy - a release-build crash on
+    * any driver that fails the map. Fail loudly and leave the buffer
+    * unmapped; the push and draw paths check for that now. */
+   if (!m)
+   {
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR,
+               "[gl_draw_buffer_map_no_bind] glMapBufferRange failed "
+               "(offset %ld, size %ld, flags 0x%X)\n",
+               (long)offset_bytes, (long)buffer_size, (unsigned)map_flags);
+      gl_diag_errors("map_no_bind/map-failed");
+   }
 
    drawbuffer->map = m;
 }
@@ -2020,6 +2157,19 @@ static void gl_renderer_draw(gl_renderer *renderer)
 
    if (!renderer || static_renderer.state == GL_STATE_INVALID)
       return;
+
+   if (!renderer->command_buffer->map)
+   {
+      /* A previous command-buffer map failed; nothing was pushed and the
+       * buffer is not mapped, so there is nothing to unmap or draw.
+       * Clear the batch bookkeeping and retry the map. */
+      renderer->command_buffer->map_index = 0;
+      renderer->primitive_ordering        = 0;
+      gl_primitive_batch_vec_clear(&renderer->batches);
+      renderer->vertex_index_pos          = 0;
+      gl_draw_buffer_map_no_bind(renderer->command_buffer);
+      return;
+   }
 
    x = renderer->config.draw_offset[0];
    y = renderer->config.draw_offset[1];
@@ -4738,6 +4888,8 @@ static void gl_context_reset(void)
     * feature-gated code path is taken. */
    gl_caps_init();
 
+   gl_normalize_inherited_state();
+
    /* If the version is below our floor, leave the renderer in
     * GL_STATE_INVALID so all subsequent rhi_gl_* entry points
     * short-circuit.  The user sees nothing render but gets an
@@ -4814,6 +4966,14 @@ static void gl_context_reset(void)
       gl_renderer_free(static_renderer.state_data);
       free(static_renderer.state_data);
       static_renderer.state_data = NULL;
+      /* Every sibling failure branch marks the state INVALID; this one
+       * did not, which left "state VALID, data NULL" behind a failed
+       * shader build -- prepare_frame then demoted to RHI_SOFTWARE, and
+       * GPU_Update walked the software line renderer over surfaces a HW
+       * session never allocates: the reported boot SEGV at
+       * GPU_Update+775. INVALID makes every rhi_gl_* entry point refuse
+       * cleanly instead. */
+      static_renderer.state      = GL_STATE_INVALID;
 
       /* Drop any pending deferred ops too: with no renderer they
        * can never be replayed, and surviving across a failed
@@ -5006,9 +5166,37 @@ bool rhi_gl_open(bool is_pal)
 #elif defined(HAVE_OPENGLES) && defined(HAVE_OPENGLES2)
    hw_render.context_type    = RETRO_HW_CONTEXT_OPENGLES2;
 #else
-   hw_render.context_type    = RETRO_HW_CONTEXT_OPENGL_CORE;
-   hw_render.version_major   = 3;
-   hw_render.version_minor   = 3;
+   /* Since RetroArch's October 2020 driver/context pairing change, an
+    * OPENGL_CORE request is served only by the glcore video driver (or
+    * through a driver switch), while the gl driver answers
+    * GET_PREFERRED_HW_RENDER with RETRO_HW_CONTEXT_OPENGL and serves
+    * that. This renderer runs fine on a desktop compatibility context:
+    * every GL 3.3 core feature it uses is a subset of what a
+    * compatibility context exposes, the "#version 330 core" shader
+    * sources are accepted there (the shader's profile qualifier is
+    * independent of the context's), and the gl_caps 3.0 floor check at
+    * context_reset still gates genuinely-too-old drivers. Pinning Core
+    * 3.3 unconditionally - as this code did from the glsm era on -
+    * therefore means the gl driver, with driver switching disabled,
+    * silently drops the whole GL renderer to software. Ask the frontend
+    * which flavour it prefers and request that first; if the first
+    * request is refused, retry once with the other flavour before
+    * giving up. */
+   {
+      unsigned pref = RETRO_HW_CONTEXT_NONE;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &pref) &&
+          pref == RETRO_HW_CONTEXT_OPENGL)
+      {
+         hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
+         profile_str            = "OpenGL (compatibility)";
+      }
+      else
+      {
+         hw_render.context_type  = RETRO_HW_CONTEXT_OPENGL_CORE;
+         hw_render.version_major = 3;
+         hw_render.version_minor = 3;
+      }
+   }
 #endif
    hw_render.context_reset      = gl_context_reset;
    hw_render.context_destroy    = gl_context_destroy;
@@ -5023,11 +5211,41 @@ bool rhi_gl_open(bool is_pal)
 
    if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
    {
+#if !defined(HAVE_OPENGLES)
+      /* Second rung of the ladder: whichever desktop flavour was
+       * refused, offer the other one. Covers frontends that reject
+       * Core on the gl driver but do not implement the preference
+       * query, and frontends whose preference answer was wrong. */
+      const char *retry_str;
+      if (hw_render.context_type == RETRO_HW_CONTEXT_OPENGL_CORE)
+      {
+         hw_render.context_type  = RETRO_HW_CONTEXT_OPENGL;
+         hw_render.version_major = 0;
+         hw_render.version_minor = 0;
+         retry_str               = "OpenGL (compatibility)";
+      }
+      else
+      {
+         hw_render.context_type  = RETRO_HW_CONTEXT_OPENGL_CORE;
+         hw_render.version_major = 3;
+         hw_render.version_minor = 3;
+         retry_str               = "OpenGL Core 3.3+";
+      }
+      log_cb(RETRO_LOG_WARN,
+            "[rhi_gl_open] frontend rejected SET_HW_RENDER for %s; "
+            "retrying as %s\n", profile_str, retry_str);
+      profile_str = retry_str;
+      if (environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
+         goto hw_render_accepted;
+#endif
       log_cb(RETRO_LOG_ERROR,
             "[rhi_gl_open] frontend rejected SET_HW_RENDER for %s\n",
             profile_str);
       return false;
    }
+#if !defined(HAVE_OPENGLES)
+hw_render_accepted:
+#endif
 
    /* No context until 'context_reset' is called */
    static_renderer.video_clock  = clock;
@@ -5093,10 +5311,17 @@ void rhi_gl_prepare_frame(void)
    renderer = static_renderer.state_data;
    if (!renderer)
    {
-      rhi_type = RHI_SOFTWARE;
+      /* Never demote to RHI_SOFTWARE here: a hardware session has no
+       * software surfaces, so the demotion sent GPU_Update's line
+       * renderer through a NULL framebuffer. Log and refuse; the
+       * INVALID state set by the failed context_reset keeps every
+       * other entry point out too. */
       log_cb(RETRO_LOG_ERROR, "[rhi_gl_prepare_frame] Renderer state marked as valid but state data is null.\n");
+      static_renderer.state = GL_STATE_INVALID;
       return;
    }
+
+   gl_normalize_inherited_state();
 
    /* In case we're upscaling we need to increase the line width
     * proportionally */
@@ -6018,6 +6243,8 @@ void rhi_gl_load_image(
       return;
    }
 
+   gl_normalize_inherited_state();
+
    if ((unsigned)x + w > VRAM_WIDTH_PIXELS ||
        (unsigned)y + h > VRAM_HEIGHT)
    {
@@ -6190,8 +6417,10 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
    GLenum   err;
    bool     ok = false;
    bool     is_32bpp;
+   bool     is_fp16;
    uint16_t *scratch_pixels = NULL;
    uint32_t *scratch_rgba8  = NULL;
+   float    *scratch_f      = NULL;
    size_t   row;
 
    if (static_renderer.state == GL_STATE_INVALID)
@@ -6211,17 +6440,29 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
       return true;
 
    is_32bpp = (renderer->internal_color_depth == 32);
-   /* The fp16 HDR target reads back through the 16bpp path: every GL
-    * conversion to 1555 / RGB5_A1 clamps to [0,1] first and quantises
-    * straight to 5 bits, which is the hardware FBRead behaviour. The
-    * RGBA8 intermediate would round to 8 bits before truncating to 5. */
-   if (renderer->fb_out_fp16)
+   /* The fp16 HDR target gets its own readback route: transfer the
+    * pixels as plain floats - the one format the spec guarantees for
+    * float color buffers - and quantise to 1555 in C. The previous
+    * route asked glReadPixels (and, upscaled, glBlitFramebuffer) to
+    * convert RGBA16F straight to packed 1555 in the driver: a rarely
+    * exercised conversion pair that Mesa implements correctly but that
+    * produced channel-scrambled VRAM on NVIDIA under savestate-heavy
+    * loads (Preemptive Frames runs this full-frame readback every
+    * frame, and any conversion defect compounds through the
+    * read -> serialize -> restore -> redraw cycle). Owning the
+    * quantisation makes the result deterministic and identical across
+    * drivers: clamp to [0,1], round to 5 bits, alpha at half - the
+    * hardware FBRead behaviour. */
+   is_fp16  = renderer->fb_out_fp16;
+   if (is_fp16)
       is_32bpp = false;
    upscale  = renderer->internal_upscaling;
    if (upscale == 0)
       upscale = 1;
    if (upscale > 1 && !gl_caps.fp_glBlitFramebuffer)
       return false;
+
+   gl_normalize_inherited_state();
 
    /* Make sure all queued draws have actually landed in fb_out before
     * we read it back. */
@@ -6261,6 +6502,12 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
       if (!scratch_rgba8)
          goto cleanup;
    }
+   if (is_fp16)
+   {
+      scratch_f = (float *)malloc((size_t)w * (size_t)h * 4u * sizeof(float));
+      if (!scratch_f)
+         goto cleanup;
+   }
 
    if (upscale == 1)
    {
@@ -6291,7 +6538,15 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
             GL_FRAMEBUFFER_COMPLETE)
       {
          GLint gl_y = (GLint)VRAM_HEIGHT - (GLint)y - (GLint)h;
-         if (is_32bpp)
+         if (is_fp16)
+         {
+            glReadPixels(
+                  (GLint) x, gl_y,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA, GL_FLOAT,
+                  scratch_f);
+         }
+         else if (is_32bpp)
          {
             glReadPixels(
                   (GLint) x, gl_y,
@@ -6322,7 +6577,11 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
        * at the blit step), then read the scratch.  We use NEAREST
        * downsampling to match the SW renderer's "no filtering"
        * behaviour. */
-      GLenum   scratch_format = is_32bpp ? GL_RGBA8 : GL_RGB5_A1;
+      /* fp16 blits into an fp16 scratch - a same-format blit, the most
+       * conservative possible - and the float readback below does the
+       * only conversion, in C. */
+      GLenum   scratch_format = is_fp16 ? GL_RGBA16F
+                              : is_32bpp ? GL_RGBA8 : GL_RGB5_A1;
 
       glGenTextures(1, &scratch_tex);
       glBindTexture(GL_TEXTURE_2D, scratch_tex);
@@ -6378,7 +6637,15 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
          glBindFramebuffer(GL_READ_FRAMEBUFFER, scratch_fbo);
          glReadBuffer(GL_COLOR_ATTACHMENT0);
 
-         if (is_32bpp)
+         if (is_fp16)
+         {
+            glReadPixels(
+                  0, 0,
+                  (GLsizei) w, (GLsizei) h,
+                  GL_RGBA, GL_FLOAT,
+                  scratch_f);
+         }
+         else if (is_32bpp)
          {
             glReadPixels(
                   0, 0,
@@ -6414,6 +6681,32 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
     *   GLES3   (GL_UNSIGNED_SHORT_5_5_5_1):     (r<<11)|(g<<6)|(b<<1)|a
     * which are the same packings the command_fragment shader
     * `rebuild_psx_color` produces. */
+   /* fp16 mode: quantise the float readback to 1555 in C, exactly what
+    * the driver conversion was asked to do before: clamp to [0,1],
+    * round each channel to 5 bits, alpha thresholds at half. Identical
+    * across drivers by construction. */
+   if (ok && is_fp16)
+   {
+      size_t n = (size_t)w * (size_t)h;
+      size_t k;
+      for (k = 0; k < n; k++)
+      {
+         const float *px = scratch_f + k * 4u;
+         float rf = px[0], gf = px[1], bf = px[2], af = px[3];
+         uint32_t r5 = rf <= 0.0f ? 0u : rf >= 1.0f ? 31u : (uint32_t)(rf * 31.0f + 0.5f);
+         uint32_t g5 = gf <= 0.0f ? 0u : gf >= 1.0f ? 31u : (uint32_t)(gf * 31.0f + 0.5f);
+         uint32_t b5 = bf <= 0.0f ? 0u : bf >= 1.0f ? 31u : (uint32_t)(bf * 31.0f + 0.5f);
+         uint32_t a1 = (af >= 0.5f) ? 1u : 0u;
+#ifdef HAVE_OPENGLES3
+         scratch_pixels[k] = (uint16_t)(
+               (r5 << 11) | (g5 << 6) | (b5 << 1) | a1);
+#else
+         scratch_pixels[k] = (uint16_t)(
+               (a1 << 15) | (b5 << 10) | (g5 << 5) | r5);
+#endif
+      }
+   }
+
    if (ok && is_32bpp)
    {
       size_t n = (size_t)w * (size_t)h;
@@ -6502,6 +6795,7 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
 cleanup:
    if (scratch_pixels)
       free(scratch_pixels);
+   free(scratch_f);
    if (scratch_rgba8)
       free(scratch_rgba8);
 

@@ -30,6 +30,7 @@ retro_input_state_t dbg_input_state_cb = 0;
 #include "mednafen/error.h"
 
 #include "pgxp/pgxp_main.h"
+#include "pgxp/pgxp_gte.h"
 
 #include "deps/openbios/openbios.bin.h"
 
@@ -4570,6 +4571,15 @@ static void check_variables(bool startup)
             psx_color_format = PSX_COLOR_FORMAT_30BIT_HDR;
       }
 
+      /* PGXP precise colour and linear-light fog are part of the 30-bit HDR
+       * mode rather than separate options: both are endpoint-exact and fall
+       * back to the architectural bytes wherever the PGXP shadow cannot be
+       * verified, so the worst case is the standard picture, and both are
+       * inert without PGXP memory tracking and off the fp16 target anyway.
+       * One switch, one look. */
+      psx_pgxp_color = (psx_color_format == PSX_COLOR_FORMAT_30BIT_HDR);
+      psx_pgxp_fog   = (psx_color_format == PSX_COLOR_FORMAT_30BIT_HDR);
+
       /* HDR highlight roll-off curve (Vulkan HDR path only): 0 Reinhard,
        * 1 ACES. Inert unless the HDR scanout is actually engaged. */
       var.key = BEETLE_OPT(hdr_shoulder);
@@ -4602,27 +4612,6 @@ static void check_variables(bool startup)
             psx_hdr_overbright_hot = 1;
       }
 
-      /* PGXP precise colour: carry the GTE's pre-saturation vertex colour
-       * to the hardware renderers. Needs PGXP memory-tracking for the
-       * shadow to exist, and only shows above white on the fp16 (HDR)
-       * target; the renderers force it off elsewhere. */
-      var.key = BEETLE_OPT(pgxp_color);
-      psx_pgxp_color = 0;
-      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-      {
-         if (!strcmp(var.value, "enabled"))
-            psx_pgxp_color = 1;
-      }
-
-      /* Linear-light depth cueing. Rides the precise-colour vertex path, so
-       * it is effective only together with it; the renderers gate on both. */
-      var.key = BEETLE_OPT(pgxp_fog);
-      psx_pgxp_fog = 0;
-      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-      {
-         if (!strcmp(var.value, "enabled"))
-            psx_pgxp_fog = 1;
-      }
 
       /* HDR true multi-pass blending (Vulkan HDR path only): 1 routes
        * non-masked subtractive prims through the per-primitive programmable
@@ -6737,6 +6726,10 @@ bool retro_serialize(void *data, size_t size)
 
 bool retro_unserialize(const void *data, size_t size)
 {
+   /* The fog sidecar ring is keyed by a push counter that restarts with the
+    * loaded state while counts inside RAM shadows survive; stale slots must
+    * not satisfy post-load lookups. */
+   PGXP_GTE_InvalidateFogRing();
    StateMem st;
    bool okay;
 
