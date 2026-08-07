@@ -35,6 +35,17 @@ struct tri_vertex
    int32_t r, g, b;
    // Precise x, y, and w coordinates using PGXP (if available)
    float precise[3];
+   /* Precise colour in 1.0 == 0xFF scale: the GTE's pre-saturation value
+    * when the PGXP shadow was accepted (may exceed 1.0), else r/g/b / 255.
+    * Only consulted by the hardware renderers when the precise-colour
+    * option is on. */
+   float cf[3];
+   /* Depth-cue sidecar for linear-light fog: far colour (1.0 == 0xFF) and
+    * blend factor in [3]. t == 0 means no cue -- the shader mix is then the
+    * identity. When fog is recovered, cf above carries the PRE-cue colour.
+    * KEEP LAST: see the Vertex struct in rhi_lib_vulkan.c for what a field
+    * inserted mid-struct does to positional initializers. */
+   float fog[4];
 };
 typedef struct tri_vertex tri_vertex;
 
@@ -250,6 +261,13 @@ struct PS_GPU
    uint16_t *vram;
 };
 typedef struct PS_GPU PS_GPU;
+
+#ifdef PSX_MEASURE_MODULATE
+/* Texture-modulation saturation counters; see ModTexel in gpu_common.h.
+ * Built only under -DPSX_MEASURE_MODULATE. */
+void GPU_GetModulateStats(uint64_t *pixels, uint64_t *sat_pixels,
+      uint64_t *sat_channels, uint32_t *peak);
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -426,6 +426,12 @@ DRAWSPRITE_T1_BMGROUP(1, 2, 1, 1)
                               (y) + (h),              /* p3y */ \
                               1, \
                               (color), (color), (color), (color), \
+                              /* Sprites keep architectural colour: their
+                               * colour is the flat command word, and the
+                               * GTE lighting the precise path recovers
+                               * lives in gouraud polygons. */ \
+                              NULL, \
+                              NULL, /* no depth-cue sidecar either */ \
                               (u),         (v), \
                               (u) + (w),   (v), \
                               (u),         (v) + (h), \

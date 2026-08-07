@@ -39,6 +39,8 @@ extern int   psx_hdr_expand_gamut;
 extern int   psx_hdr_shoulder;
 extern int   psx_hdr_sdr_eotf;
 extern int   psx_hdr_overbright_hot;
+extern int   psx_pgxp_color;   /* PGXP precise colour: vertex colour may exceed 1.0 on fp16 */
+extern int   psx_pgxp_fog;     /* PGXP linear-light depth cue; effective only with precise colour */
 extern int   psx_src_primaries;
 
 /* fp16 render targets are core on desktop GL 3.0+; GLES3 needs an
@@ -513,8 +515,11 @@ typedef struct gl_attribute gl_attribute;
 struct gl_command_vertex {
    /* Position in PlayStation VRAM coordinates */
    float position[4];
-   /* RGB color, 8bits per component */
-   uint8_t color[3];
+   /* RGB colour, 1.0 == 0xFF. Float rather than bytes so the PGXP
+    * precise-colour path can carry the GTE's pre-saturation value, which
+    * exceeds 1.0 for over-range lighting. Without precise colour the values
+    * here are exactly byte/255, so the shader sees bit-identical inputs. */
+   float color[3];
    /* gl_texture coordinates within the page */
    uint16_t texture_coord[2];
    /* gl_texture page (base offset in VRAM used for texture lookup) */
@@ -534,6 +539,13 @@ struct gl_command_vertex {
    uint16_t texture_limits[4];
    /* gl_texture window mask/OR values */
    uint8_t texture_window[4];
+   /* Depth-cue sidecar: far colour (1.0 == 0xFF) in [0..2], blend factor in
+    * [3]. t == 0 makes the shader mix the identity, so vertices without a
+    * recovered cue cost nothing. KEEP LAST -- positional initializers above
+    * omit trailing fields and zero-fill them, which is exactly what a
+    * cue-less vertex wants; a field inserted mid-struct shifts every
+    * initializer after it (see the Vertex struct in rhi_lib_vulkan.c). */
+   float fog[4];
 };
 typedef struct gl_command_vertex gl_command_vertex;
 
@@ -2097,8 +2109,17 @@ static void gl_renderer_draw(gl_renderer *renderer)
           * additive draws on the fp16 target only, matching the Vulkan
           * renderer (primitive.frag gates hot on BLEND_ADD). */
          glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "hdr_hot"),
-               (renderer->fb_out_fp16 && psx_hdr_overbright_hot && !it->opaque &&
-                it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD) ? 1u : 0u);
+               (renderer->fb_out_fp16 &&
+                ((psx_hdr_overbright_hot && !it->opaque &&
+                  it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD)
+                 /* Precise colour: the over-white lives in the vertex
+                  * colour itself, so the source clamp must stand aside on
+                  * every draw, not just plain additive. Safe because the
+                  * shadow's accept rule refuses anything that would not
+                  * requantize to the architectural bytes. */
+                 || psx_pgxp_color)) ? 1u : 0u);
+         glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "pgxp_fog"),
+               (renderer->fb_out_fp16 && psx_pgxp_color && psx_pgxp_fog) ? 1u : 0u);
       }
       if (opaque)
          glDisable(GL_BLEND);
@@ -4324,7 +4345,8 @@ static void push_primitive(
  * accessor helpers since the layouts never change at runtime. */
 static const struct gl_attribute gl_command_vertex_attribs[] = {
    { "position",           offsetof(gl_command_vertex, position),           GL_FLOAT,          4 },
-   { "color",              offsetof(gl_command_vertex, color),              GL_UNSIGNED_BYTE,  3 },
+   { "color",              offsetof(gl_command_vertex, color),              GL_FLOAT,          3 },
+   { "fog",                offsetof(gl_command_vertex, fog),                GL_FLOAT,          4 },
    { "texture_coord",      offsetof(gl_command_vertex, texture_coord),      GL_UNSIGNED_SHORT, 2 },
    { "texture_page",       offsetof(gl_command_vertex, texture_page),       GL_UNSIGNED_SHORT, 2 },
    { "clut",               offsetof(gl_command_vertex, clut),               GL_UNSIGNED_SHORT, 2 },
@@ -5571,6 +5593,19 @@ void rhi_gl_set_display_mode(bool depth_24bpp,
 
 /* Draw commands */
 
+
+/* Vertex colour for slot `i`: the precise (pre-saturation) value when the
+ * caller supplied one, else the packed byte unpacked to the same scale.
+ * 1.0 == 0xFF either way, so without precise colour this is bit-identical
+ * to the old byte path. */
+static INLINE float gl_vcol(const float *precise_rgb, int vtx, int chan,
+      uint32_t packed)
+{
+   if (precise_rgb)
+      return precise_rgb[vtx * 3 + chan];
+   return (float)((packed >> (chan * 8)) & 0xFF) / 255.0f;
+}
+
 void rhi_gl_push_triangle(
       float p0x, float p0y, float p0w,
       float p1x, float p1y, float p1w,
@@ -5578,6 +5613,8 @@ void rhi_gl_push_triangle(
       uint32_t c0,
       uint32_t c1,
       uint32_t c2,
+      const float *precise_rgb,
+      const float *fog,
       uint16_t t0x, uint16_t t0y,
       uint16_t t1x, uint16_t t1y,
       uint16_t t2x, uint16_t t2y,
@@ -5634,9 +5671,9 @@ void rhi_gl_push_triangle(
          {
             {p0x, p0y, 0.95, p0w},   /* position */
             {
-               (uint8_t) c0,
-               (uint8_t) (c0 >> 8),
-               (uint8_t) (c0 >> 16)
+               gl_vcol(precise_rgb, 0, 0, c0),
+               gl_vcol(precise_rgb, 0, 1, c0),
+               gl_vcol(precise_rgb, 0, 2, c0)
             }, /* color */
             {t0x, t0y},   /* texture_coord */
             {texpage_x, texpage_y},
@@ -5650,9 +5687,9 @@ void rhi_gl_push_triangle(
          {
             {p1x, p1y, 0.95, p1w }, /* position */
             {
-               (uint8_t) c1,
-               (uint8_t) (c1 >> 8),
-               (uint8_t) (c1 >> 16)
+               gl_vcol(precise_rgb, 1, 0, c1),
+               gl_vcol(precise_rgb, 1, 1, c1),
+               gl_vcol(precise_rgb, 1, 2, c1)
             }, /* color */
             {t1x, t1y}, /* texture_coord */
             {texpage_x, texpage_y},
@@ -5666,9 +5703,9 @@ void rhi_gl_push_triangle(
          {
             {p2x, p2y, 0.95, p2w }, /* position */
             {
-               (uint8_t) c2,
-               (uint8_t) (c2 >> 8),
-               (uint8_t) (c2 >> 16)
+               gl_vcol(precise_rgb, 2, 0, c2),
+               gl_vcol(precise_rgb, 2, 1, c2),
+               gl_vcol(precise_rgb, 2, 2, c2)
             }, /* color */
             {t2x, t2y}, /* texture_coord */
             {texpage_x, texpage_y},
@@ -5680,6 +5717,12 @@ void rhi_gl_push_triangle(
             {min_u, min_v, max_u, max_v},
          }
       };
+
+      { int _fi, _fc;
+        for (_fi = 0; _fi < 3; _fi++)
+           for (_fc = 0; _fc < 4; _fc++)
+              v[_fi].fog[_fc] = fog ? fog[_fi * 4 + _fc] : 0.0f; }
+
 
       push_primitive(renderer, v, 3, GL_TRIANGLES,
             semi_transparency_mode, mask_test, set_mask);
@@ -5695,6 +5738,8 @@ void rhi_gl_push_quad(
       uint32_t c1,
       uint32_t c2,
       uint32_t c3,
+      const float *precise_rgb,
+      const float *fog,
       uint16_t t0x, uint16_t t0y,
       uint16_t t1x, uint16_t t1y,
       uint16_t t2x, uint16_t t2y,
@@ -5757,9 +5802,9 @@ void rhi_gl_push_quad(
          {
             {p0x, p0y, 0.95, p0w},   /* position */
             {
-               (uint8_t) c0,
-               (uint8_t) (c0 >> 8),
-               (uint8_t) (c0 >> 16)
+               gl_vcol(precise_rgb, 0, 0, c0),
+               gl_vcol(precise_rgb, 0, 1, c0),
+               gl_vcol(precise_rgb, 0, 2, c0)
             }, /* color */
             {t0x, t0y},   /* texture_coord */
             {texpage_x, texpage_y},
@@ -5773,9 +5818,9 @@ void rhi_gl_push_quad(
          {
             {p1x, p1y, 0.95, p1w }, /* position */
             {
-               (uint8_t) c1,
-               (uint8_t) (c1 >> 8),
-               (uint8_t) (c1 >> 16)
+               gl_vcol(precise_rgb, 1, 0, c1),
+               gl_vcol(precise_rgb, 1, 1, c1),
+               gl_vcol(precise_rgb, 1, 2, c1)
             }, /* color */
             {t1x, t1y}, /* texture_coord */
             {texpage_x, texpage_y},
@@ -5789,9 +5834,9 @@ void rhi_gl_push_quad(
          {
             {p2x, p2y, 0.95, p2w }, /* position */
             {
-               (uint8_t) c2,
-               (uint8_t) (c2 >> 8),
-               (uint8_t) (c2 >> 16)
+               gl_vcol(precise_rgb, 2, 0, c2),
+               gl_vcol(precise_rgb, 2, 1, c2),
+               gl_vcol(precise_rgb, 2, 2, c2)
             }, /* color */
             {t2x, t2y}, /* texture_coord */
             {texpage_x, texpage_y},
@@ -5805,9 +5850,9 @@ void rhi_gl_push_quad(
          {
             {p3x, p3y, 0.95, p3w }, /* position */
             {
-               (uint8_t) c3,
-               (uint8_t) (c3 >> 8),
-               (uint8_t) (c3 >> 16)
+               gl_vcol(precise_rgb, 3, 0, c3),
+               gl_vcol(precise_rgb, 3, 1, c3),
+               gl_vcol(precise_rgb, 3, 2, c3)
             }, /* color */
             {t3x, t3y}, /* texture_coord */
             {texpage_x, texpage_y},
@@ -5819,6 +5864,12 @@ void rhi_gl_push_quad(
             { min_u, min_v, max_u, max_v },
          },
       };
+
+      { int _fi, _fc;
+        for (_fi = 0; _fi < 4; _fi++)
+           for (_fc = 0; _fc < 4; _fc++)
+              v[_fi].fog[_fc] = fog ? fog[_fi * 4 + _fc] : 0.0f; }
+
 
       is_semi_transparent = v[0].semi_transparent == 1;
       is_textured         = v[0].texture_blend_mode != 0;
@@ -5895,9 +5946,9 @@ void rhi_gl_push_line(
          {
             {(float)p0x, (float)p0y, 0., 1.0}, /* position */
             {
-               (uint8_t) c0,
-               (uint8_t) (c0 >> 8),
-               (uint8_t) (c0 >> 16)
+               gl_vcol(NULL, 0, 0, c0),
+               gl_vcol(NULL, 0, 1, c0),
+               gl_vcol(NULL, 0, 2, c0)
             }, /* color */
             {0, 0}, /* texture_coord */
             {0, 0}, /* texture_page */
@@ -5910,9 +5961,9 @@ void rhi_gl_push_line(
          {
             {(float)p1x, (float)p1y, 0., 1.0}, /* position */
             {
-               (uint8_t) c1,
-               (uint8_t) (c1 >> 8),
-               (uint8_t) (c1 >> 16)
+               gl_vcol(NULL, 1, 0, c1),
+               gl_vcol(NULL, 1, 1, c1),
+               gl_vcol(NULL, 1, 2, c1)
             }, /* color */
             {0, 0}, /* texture_coord */
             {0, 0}, /* texture_page */

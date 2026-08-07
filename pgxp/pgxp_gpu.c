@@ -25,12 +25,19 @@
 *      Author: iCatButler
 ***************************************************************************/
 #include "pgxp_gpu.h"
+#include "pgxp_gte.h"
 #include "pgxp_main.h"
 #include "pgxp_mem.h"
 #include "pgxp_value.h"
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
 #include <assert.h>
+
+#include <libretro.h>
+
+extern retro_log_printf_t log_cb;
 
 /* ============================================================
  * Partial FIFO and Command Buffer implementation
@@ -245,6 +252,178 @@ void PGXP_SetAddress(uint32_t addr)
 }
 
 /* Get single parallel vertex value */
+static uint32_t color_stats[4]; /* attempts, hits, value miss, quant miss */
+
+/* Over-range measurement.
+ *
+ * The hit rate answers "can the precise colour be recovered". It does not
+ * answer "is there anything above white to recover", and for the HDR
+ * renderer slice that second question is the one that decides the feature:
+ * a high hit rate over content whose lighting never exceeds the Color FIFO
+ * ceiling buys exactly nothing, because every recovered value requantizes to
+ * the byte the architectural path already had.
+ *
+ * Only accepted words are counted -- a shadow that was refused cannot be
+ * used no matter how bright it is. Buckets are on the peak channel relative
+ * to the 255 ceiling, so bucket 0 is a colour that would clip slightly and
+ * bucket 3 is one the GTE computed at more than twice white. */
+static uint32_t color_over;          /* accepted words with any channel > 255 */
+static uint32_t color_over_bucket[4];/* (1,1.25] (1.25,1.5] (1.5,2] (2,inf) */
+static float    color_peak;          /* largest channel seen, 8-bit scale */
+
+static void color_note_range(float r, float g, float b)
+{
+   float peak = r;
+   float ratio;
+
+   if (g > peak) peak = g;
+   if (b > peak) peak = b;
+
+   if (peak > color_peak)
+      color_peak = peak;
+
+   if (!(peak > 255.0f))
+      return;
+
+   color_over++;
+   ratio = peak / 255.0f;
+   if (ratio <= 1.25f)      color_over_bucket[0]++;
+   else if (ratio <= 1.5f)  color_over_bucket[1]++;
+   else if (ratio <= 2.0f)  color_over_bucket[2]++;
+   else                     color_over_bucket[3]++;
+}
+
+/* Requantize a shadow channel exactly as gte.c's MAC_to_RGB_FIFO did:
+ * MACn >> 4 is an arithmetic shift (floor), then Lm_C saturates to
+ * 0..0xFF.  The shadow holds MACn/16.0f, so floor+saturate here inverts
+ * it bit-exactly wherever the result is not saturated (the float is
+ * exact below 2^24, see the push site), and saturation absorbs any
+ * conversion rounding above that.  Returns -1 for non-finite input so
+ * a corrupt shadow can never match. */
+static int32_t pgxp_requant8(float f)
+{
+	int32_t q;
+	if (!(f >= -2147483648.0f && f < 2147483648.0f))
+		return -1;
+	q = (int32_t)floor((double)f);
+	if (q < 0)
+		return 0;
+	if (q > 0xFF)
+		return 0xFF;
+	return q;
+}
+
+int PGXP_GetColor(const uint32_t offset, const uint32_t* addr, float* out_rgb)
+{
+	PGXP_value* col = PGXP_ReadCB(offset);
+	uint32_t word   = *addr;
+	int ok          = 0;
+
+	color_stats[0]++;
+
+	if (col && ((col->flags & VALID_012) == VALID_012) &&
+	    (((col->value ^ word) & 0x00FFFFFFu) == 0))
+	{
+		/* Byte 3 is the GP0 command code and is excluded from the value
+		 * match: the swc2-$22 idiom carries it through the GTE CD field
+		 * (full-word match), while the mfc2+or idiom rewrites it on the
+		 * CPU.  The requantization test below is the actual guarantee
+		 * either way. */
+		if (pgxp_requant8(col->x) == (int32_t)(word & 0xFF) &&
+		    pgxp_requant8(col->y) == (int32_t)((word >> 8) & 0xFF) &&
+		    pgxp_requant8(col->z) == (int32_t)((word >> 16) & 0xFF))
+		{
+			if (out_rgb)
+			{
+				out_rgb[0] = col->x;
+				out_rgb[1] = col->y;
+				out_rgb[2] = col->z;
+			}
+			/* Recorded whether or not the caller wanted the value: the
+			 * measurement slice passes NULL and this is the number it
+			 * exists to collect. */
+			color_note_range(col->x, col->y, col->z);
+			color_stats[1]++;
+			ok = 1;
+		}
+		else
+			color_stats[3]++;
+	}
+	else
+		color_stats[2]++;
+
+	/* Instrumentation for the go/no-go measurement: one cumulative line
+	 * per ~1M gouraud/flat color words.  Scaffolding - the durable API
+	 * is PGXP_GetColorStats; this line goes away with the renderer
+	 * slice.  log_cb is NULL both before the frontend installs it and in
+	 * the offline harness, which links this TU without libretro.c. */
+	if (!(color_stats[0] & 0xFFFFFu) && log_cb)
+	{
+		log_cb(RETRO_LOG_INFO,
+		      "[PGXP color] words=%u hit=%u (%.1f%%) value-miss=%u quant-miss=%u\n",
+		      color_stats[0], color_stats[1],
+		      100.0 * (double)color_stats[1] / (double)color_stats[0],
+		      color_stats[2], color_stats[3]);
+		/* The go/no-go for an HDR renderer slice is this line, not the
+		 * one above: over=0 means the recovered colours are all inside
+		 * the byte range the architectural path already carried, and a
+		 * wide framebuffer has nothing to hold. */
+		log_cb(RETRO_LOG_INFO,
+		      "[PGXP color] over-white=%u (%.2f%% of hits) "
+		      "buckets<=1.25x/1.5x/2x/>2x=%u/%u/%u/%u peak=%.1f (%.2fx)\n",
+		      color_over,
+		      color_stats[1] ? 100.0 * (double)color_over / (double)color_stats[1] : 0.0,
+		      color_over_bucket[0], color_over_bucket[1],
+		      color_over_bucket[2], color_over_bucket[3],
+		      color_peak, (double)color_peak / 255.0);
+	}
+
+	return ok;
+}
+
+int PGXP_GetFog(const uint32_t offset, const uint32_t* addr,
+		float out_pre[3], float out_fc[3], float* out_t)
+{
+	PGXP_value* col = PGXP_ReadCB(offset);
+	float       rgb[3];
+
+	/* The colour accept is the safety gate; run it first (it also keeps the
+	 * hit statistics honest -- a fog probe is a colour probe). */
+	if (!PGXP_GetColor(offset, addr, rgb))
+		return 0;
+
+	if (!col)
+		return 0;
+
+	if (!PGXP_GTE_GetFogByCount(col->count, out_pre, out_fc, out_t))
+		return 0;
+
+	return 1;
+}
+
+void PGXP_GetColorRangeStats(uint32_t *over, uint32_t buckets[4], float *peak)
+{
+	if (over)
+		*over = color_over;
+	if (buckets)
+	{
+		buckets[0] = color_over_bucket[0];
+		buckets[1] = color_over_bucket[1];
+		buckets[2] = color_over_bucket[2];
+		buckets[3] = color_over_bucket[3];
+	}
+	if (peak)
+		*peak = color_peak;
+}
+
+void PGXP_GetColorStats(uint32_t stats[4])
+{
+	stats[0] = color_stats[0];
+	stats[1] = color_stats[1];
+	stats[2] = color_stats[2];
+	stats[3] = color_stats[3];
+}
+
 int PGXP_GetVertex(const uint32_t offset, const uint32_t* addr, OGLVertex* pOutput, int xOffs, int yOffs)
 {
 	PGXP_value* vert = PGXP_ReadCB(offset);          /* pointer to vertex */
