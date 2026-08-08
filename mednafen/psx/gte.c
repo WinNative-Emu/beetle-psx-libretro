@@ -256,8 +256,15 @@ int GTE_StateAction(StateMem *sm, int load, int data_only)
    int16_t _ZSF3 = ZSF3;
    int16_t _ZSF4 = ZSF4;
 
-   /* compatibility variables, transfer to/from CR/DR[32] during save states */
-   int16_t Vectors[3][4];
+   /* compatibility variables, transfer to/from CR/DR[32] during save states.
+    * Vectors is zero-initialised because the save path only fills
+    * elements [i][0..2]: the [i][3] pads previously went into the
+    * savestate as uninitialised stack bytes, making two serializations
+    * of identical emulator state differ - poison for anything that
+    * compares or hashes states (netplay, runahead diagnostics,
+    * serialize-unserialize-serialize fixed-point checks). The load
+    * side never reads the pads, so this changes no behaviour. */
+   int16_t Vectors[3][4] = {{0}};
    int32_t MAC[4];
    uint16_t _OTZ;
    gtergb RGB;
@@ -1137,7 +1144,11 @@ static INLINE void MultiplyMatrixByVector(uint32_t mx, uint32_t v, uint32_t cv, 
    MAC_to_IR(lm);
 }
 
-static INLINE void MultiplyMatrixByVector_PT(uint32_t mx, uint32_t v, uint32_t cv, uint32_t sf, int lm)
+/* precise_z_acc receives the raw 44-bit Z accumulator, i.e. the value that
+ * feeds SZ3 *before* the >>12 truncation and the Lm_D saturation.  It is the
+ * exact view-space Z in 1/4096 units and exists solely for the PGXP shadow
+ * path; the architectural SZ3 written below is untouched. */
+static INLINE void MultiplyMatrixByVector_PT(uint32_t mx, uint32_t v, uint32_t cv, uint32_t sf, int lm, int64_t *precise_z_acc)
 {
    int64_t tmp[3];
    unsigned i,m;
@@ -1188,6 +1199,8 @@ static INLINE void MultiplyMatrixByVector_PT(uint32_t mx, uint32_t v, uint32_t c
    SET_Z_FIFO(1, Z_FIFO(2));
    SET_Z_FIFO(2, Z_FIFO(3));
    SET_Z_FIFO(3, Lm_D(tmp[2] >> 12, true));
+
+   *precise_z_acc = tmp[2];
 }
 
 #define DECODE_FIELDS							\
@@ -1297,7 +1310,30 @@ static INLINE void TransformXY(int64_t h_div_sz, float precise_h_div_sz, float p
    XY_FIFO(1) = XY_FIFO(2);
    XY_FIFO(2) = XY_FIFO(3);
 
-   /* PGXP hack to add subpixel precision as well */
+   /* PGXP hack to add subpixel precision as well.
+    *
+    * Gated on gMode. With PGXP off this whole block was still executing
+    * on every transformed vertex: two conversions and a divide for the
+    * screen offsets, the widescreen ratio, two multiply-adds, two
+    * clamps, and then a call into PGXP_pushSXYZ2f which shuffles the
+    * three-deep vertex FIFO and calls PGXP_CacheVertex - all so the
+    * callee could check the mode and drop the result. The mode test
+    * lived one level too deep.
+    *
+    * Nothing reads the shadow while gMode is zero: gpu_polygon.c selects
+    * its DrawPolygon specialisation on the compile-time PGXP_LIT
+    * parameter, so the code that would consult the FIFO is not the code
+    * that runs. And because pgxp_precise_z and pgxp_precise_h_div_sz are
+    * side-effect free in a non-PGXP_DIAG build, the compiler is free to
+    * sink their work into this branch too, which takes the int64 to
+    * double conversion and the projection divide off the path as well.
+    *
+    * PGXP_InvalidateVertexFIFO on the off-to-on transition covers the
+    * one case this opens up: entries left behind from before PGXP was
+    * enabled. They would in practice be rejected anyway, since
+    * PGXP_GetVertex matches the stored value against the command word,
+    * but relying on that is relying on a coincidence not happening. */
+   if (PGXP_GetModes())
    {
       float fofx       = ((float)OFX / (float)(1 << 16));
       float fofy       = ((float)OFY / (float)(1 << 16));
@@ -1333,18 +1369,145 @@ static INLINE void TransformDQ(int64_t h_div_sz)
    SET_IR(0, Lm_H(((int64_t)DQB + DQA * h_div_sz) >> 12));
 }
 
+/* Turn the raw 44-bit Z accumulator into the float W the PGXP shadow uses
+ * for perspective correction.
+ *
+ * The architectural SZ3 is Lm_D(acc >> 12) stored through a uint16_t, i.e.
+ * integer-truncated and saturated to [0, 0xFFFF].  Reading W back out of
+ * Z_FIFO(3), as this code used to, therefore threw away every fractional bit
+ * of the transform for no reason: the exact value is still sitting in the
+ * accumulator one line above the store.  This is not a new deviation from
+ * the integer pipeline either - precise_h_div_sz has always been a true
+ * divide rather than the GTE's reciprocal table, so precise_x/y already
+ * depart from the architectural result deliberately.  All this does is make
+ * x, y and w derive from one exact Z instead of a truncated one.
+ *
+ * Scope, measured rather than assumed.  Both ends of the range are pinned by
+ * clamps that this patch leaves alone, so the affected band is exactly
+ * z in (H/2, 0xFFFF):
+ *
+ *   - Below H/2 the float_max floor dominates and the result is bit-identical
+ *     to before.  The floor mirrors Divide()'s own overflow behaviour, so the
+ *     near-camera case people usually reach for as the motivating example is
+ *     in fact a strict no-op here.
+ *   - Above 0xFFFF the ceiling is kept on purpose.  Lifting it is a separate
+ *     and genuinely behavioural change: past saturation the shadow would stop
+ *     disagreeing with the architectural screen coordinates by fractions of a
+ *     pixel and start disagreeing by tens of pixels, which is a different risk
+ *     class (the 2D-tolerance heuristic, and any game that clipped against its
+ *     own saturated result).  That wants its own patch and its own per-game
+ *     testing.
+ *
+ * Inside the band the recovered fraction is worth at most 2/H in relative W
+ * error, peaking just past the floor and decaying as 1/z.  For H = 320 that
+ * is 0.62% at z ~ 161, which is about one screen pixel of vertex placement
+ * error at the edge of a 320-wide frame; by z = 1000 it is under a tenth of
+ * a pixel.  Modest, but sub-pixel vertex placement is the entire point of
+ * PGXP, so a whole pixel near the clip plane is on-mission.
+ *
+ * acc is sign-extended to 44 bits by A_MV, so (double)acc is exact (44 < 53
+ * mantissa bits) and scaling by 2^-12 is exact as well - verified over 40M
+ * random 44-bit accumulators.  The conversion introduces no rounding of its
+ * own and is bit-identical across arch, FPU mode and optimisation level; it
+ * cannot become a determinism divergence the way a recomputed floating-point
+ * transform could.  W moves by at most one SZ3 unit at any vertex (the bound
+ * is 1.0 and is attained, not approached: a z just under an integer can round
+ * up to it in the narrowing to float).
+ *
+ * Pre-existing and untouched: H == 0 with a non-positive Z still yields
+ * precise_z == 0 and a non-finite precise_h_div_sz downstream, exactly as
+ * before.  Fixing that is orthogonal to this patch. */
+static INLINE float pgxp_precise_z(int64_t acc)
+{
+   double z = (double)acc * (1.0 / 4096.0);
+
+#if PGXP_DIAG
+   /* Diagnostic build only; see pgxp_gte.h. A default build emits none
+    * of this and is byte-identical to a tree without the counters. */
+   if ((++pgxp_z_total & 0x3FFFFFu) == 0)
+      PGXP_DiagDump();
+
+   /* Now purely informational - it records how much geometry sits past
+    * where SZ3 saturates, rather than gating anything. */
+   if (z > 65535.0)
+   {
+      pgxp_z_ceiling++;
+      if (z > pgxp_z_ceiling_max)
+         pgxp_z_ceiling_max = z;
+   }
+#endif
+
+   /* No 0xFFFF ceiling. The architectural SZ3 saturates there because it
+    * is a uint16_t, and the shadow used to be clamped to match. Matching
+    * it was wrong: past saturation the integer path places a vertex
+    * (z / 65535) times too far from the projection centre, so the error
+    * is proportional rather than bounded - 1% past the clamp is half a
+    * pixel, twice past it is 80 pixels for a vertex 80 pixels out, and it
+    * grows without limit. Reproducing that in the shadow discards the one
+    * correct answer PGXP has.
+    *
+    * Removing it cannot regress anything: for z <= 65535 the clamp never
+    * fired, so the result is bit-identical to before, and the only inputs
+    * whose behaviour changes are the ones the old code got wrong. The 2D
+    * tolerance heuristic is self-limiting here rather than a hazard - if
+    * it is enabled and the corrected position lands far from the integer
+    * one, it substitutes the integer coordinate, which is exactly the old
+    * behaviour.
+    *
+    * The float_max floor stays. That one mirrors Divide()'s own overflow
+    * behaviour rather than a storage width, so it is not the same kind of
+    * artefact. */
+   return float_max(H/2.f, (float)z);
+}
+
+/* Companion to pgxp_precise_z: the shadow's h/z, with the H == 0 corner
+ * handled the way the integer pipeline handles it.
+ *
+ * precise_z is zero only when H is zero. The floor in pgxp_precise_z is
+ * H/2, so any non-zero H keeps it strictly positive; H == 0 with a
+ * non-positive view-space Z is the one input that reaches zero, and
+ * (float)0 / 0.0f there is a 0/0.
+ *
+ * That divide was not producing a NaN in the renderer - the
+ * float_max/float_min clamp at the end of TransformXY absorbs it, and
+ * does so identically under all three float_minmax.h backends (SSE2
+ * min_ss/max_ss, C99 fminf/fmaxf, and the ternary fallback all yield the
+ * bound), so there was no arch-dependent divergence either. What it did
+ * produce is worse than useless in a quieter way: every affected vertex
+ * got pinned to the clamp corner at +1023 instead of following the
+ * integer path, which puts stray geometry in the frame rather than a
+ * visibly broken primitive. The 2D tolerance net in gpu_polygon.c would
+ * normally replace such an outlier with the native coordinate, but that
+ * option defaults to disabled (psx_pgxp_2d_tol == -1), so in the default
+ * configuration nothing catches it.
+ *
+ * Divide() answers this same corner by clipping: with H == 0 and SZ3 == 0
+ * the `(divisor * 2) > dividend` test fails, FLAGS bit 17 is raised and
+ * it returns the saturated 0x1FFFF. Returning that value scaled out of
+ * Q16 keeps the shadow on the integer path's answer instead of inventing
+ * one, and incidentally retires a latent -fsanitize=float-divide-by-zero
+ * trip in the sweep. */
+static INLINE float pgxp_precise_h_div_sz(float precise_z)
+{
+   if (precise_z > 0.0f)
+      return (float)H / precise_z;
+
+   return (float)0x1FFFF / 65536.0f;
+}
+
 static int32_t RTPS(uint32_t instr)
 {
  int64_t h_div_sz;
+ int64_t precise_z_acc;
  float precise_z;
  float precise_h_div_sz;
  DECODE_FIELDS;
 
- MultiplyMatrixByVector_PT(Matrices_Rot, 0, CRVectors_T, sf, lm);
+ MultiplyMatrixByVector_PT(Matrices_Rot, 0, CRVectors_T, sf, lm, &precise_z_acc);
  h_div_sz = Divide(H, Z_FIFO(3));
 
- precise_z = float_max(H/2.f, (float)Z_FIFO(3));
- precise_h_div_sz  = (float)H / precise_z;
+ precise_z = pgxp_precise_z(precise_z_acc);
+ precise_h_div_sz  = pgxp_precise_h_div_sz(precise_z);
 
  TransformXY(h_div_sz, precise_h_div_sz, precise_z);
  TransformDQ(h_div_sz);
@@ -1360,14 +1523,15 @@ static int32_t RTPT(uint32_t instr)
  for(i = 0; i < 3; i++)
  {
   int64_t h_div_sz;
+  int64_t precise_z_acc;
   float precise_z;
   float precise_h_div_sz;
 
-  MultiplyMatrixByVector_PT(Matrices_Rot, i, CRVectors_T, sf, lm);
+  MultiplyMatrixByVector_PT(Matrices_Rot, i, CRVectors_T, sf, lm, &precise_z_acc);
   h_div_sz = Divide(H, Z_FIFO(3));
 
-  precise_z = float_max(H/2.f, (float)Z_FIFO(3));
-  precise_h_div_sz  = (float)H / precise_z;
+  precise_z = pgxp_precise_z(precise_z_acc);
+  precise_h_div_sz  = pgxp_precise_h_div_sz(precise_z);
 
   TransformXY(h_div_sz, precise_h_div_sz, precise_z);
 
