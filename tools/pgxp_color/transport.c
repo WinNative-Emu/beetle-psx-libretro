@@ -270,6 +270,158 @@ static void test_untracked_colour(void)
       fail("untracked colour accepted from stale shadow", 0, 0);
 }
 
+static void test_nclip_magnitude(void)
+{
+   if (PGXP_NCLIP_preserve_magnitude(1234, -1) != -1234)
+      fail("NCLIP positive orientation replacement", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(-4321, 1) != 4321)
+      fail("NCLIP negative orientation replacement", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(1234, 1) != 1234)
+      fail("NCLIP changed matching magnitude", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(1234, 0) != 1234)
+      fail("NCLIP replaced native result with zero", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(0, -1) != -1)
+      fail("NCLIP lost orientation at native zero", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(0, 1) != 1)
+      fail("NCLIP lost positive orientation at native zero", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(INT32_MIN, -1) != INT32_MIN)
+      fail("NCLIP changed matching minimum", 0, 1);
+   if (PGXP_NCLIP_preserve_magnitude(INT32_MIN, 1) != INT32_MAX)
+      fail("NCLIP overflowed reversed minimum", 0, 1);
+
+   SetValue(&GTE_data_reg[12], 0);
+   SetValue(&GTE_data_reg[13], 0);
+   SetValue(&GTE_data_reg[14], 0);
+   if (PGXP_NCLIP_valid(0, 0, 0))
+      fail("NCLIP accepted vertices without precise Z", 1, 0);
+   GTE_data_reg[12].flags |= VALID_2;
+   GTE_data_reg[13].flags |= VALID_2;
+   GTE_data_reg[14].flags |= VALID_2;
+   if (!PGXP_NCLIP_valid(0, 0, 0))
+      fail("NCLIP rejected precise XYZ vertices", 0, 1);
+
+   GTE_data_reg[12].x = 0.0f;
+   GTE_data_reg[12].y = 0.0f;
+   GTE_data_reg[13].x = 1.0f;
+   GTE_data_reg[13].y = 0.0f;
+   GTE_data_reg[14].x = 0.0f;
+   GTE_data_reg[14].y = 1.0f;
+   if (PGXP_NCLIP_sign() != 1)
+      fail("NCLIP lost positive precise orientation", 0, 1);
+   GTE_data_reg[13].x = 0.0f;
+   GTE_data_reg[13].y = 1.0f;
+   GTE_data_reg[14].x = 1.0f;
+   GTE_data_reg[14].y = 0.0f;
+   if (PGXP_NCLIP_sign() != -1)
+      fail("NCLIP lost negative precise orientation", 0, 1);
+   GTE_data_reg[14].x = 0.05f;
+   if (PGXP_NCLIP_sign() != 0)
+      fail("NCLIP accepted unstable precise orientation", 1, 0);
+   GTE_data_reg[14].x = 0.101f;
+   if (PGXP_NCLIP_sign() != -1)
+      fail("NCLIP rejected stable precise orientation", 0, 1);
+   GTE_data_reg[13].x = 1.0f;
+   GTE_data_reg[13].y = 0.0f;
+   GTE_data_reg[14].x = 0.0f;
+   GTE_data_reg[14].y = 0.101f;
+   if (PGXP_NCLIP_sign() != 1)
+      fail("NCLIP rejected stable positive orientation", 0, 1);
+}
+
+static void test_architectural_zero_add_identity(void)
+{
+   const uint32_t runtime_zero_operands = INSTR_RS(4) | INSTR_RT(3) |
+      INSTR_RD(5) | 0x21u;
+   const uint32_t architectural_right_zero = INSTR_RS(4) |
+      INSTR_RD(5) | 0x21u;
+   const uint32_t architectural_left_zero = INSTR_RT(3) |
+      INSTR_RD(5) | 0x21u;
+
+   CPU_reg[4] = PGXP_value_zero;
+   SetValue(&CPU_reg[4], 1);
+   CPU_reg[4].x = 1.25f;
+   CPU_reg[4].z = 7.5f;
+   CPU_reg[0] = PGXP_value_zero;
+   PGXP_CPU_ADDU(architectural_right_zero, 1, 1, 0);
+   if (CPU_reg[5].x != 1.25f || CPU_reg[5].z != 7.5f)
+      fail("architectural right-zero ADD lost identity", 0, 1);
+
+   CPU_reg[3] = PGXP_value_zero;
+   SetValue(&CPU_reg[3], 1);
+   CPU_reg[3].x = 1.25f;
+   CPU_reg[3].z = 7.5f;
+   PGXP_CPU_ADDU(architectural_left_zero, 1, 0, 1);
+   if (CPU_reg[5].x != 1.25f || CPU_reg[5].z != 7.5f)
+      fail("architectural left-zero ADD lost identity", 0, 1);
+
+   /* Ordinary registers whose native value happens to be zero may still
+    * carry meaningful fractional coordinates on either side. */
+   SetValue(&CPU_reg[4], 1);
+   SetValue(&CPU_reg[3], 0);
+   CPU_reg[4].x = 1.25f;
+   CPU_reg[3].x = 0.5f;
+   PGXP_CPU_ADDU(runtime_zero_operands, 1, 1, 0);
+   if (CPU_reg[5].x != 1.75f)
+      fail("runtime-zero right ADD lost precision", 0, 1);
+
+   SetValue(&CPU_reg[4], 0);
+   SetValue(&CPU_reg[3], 1);
+   CPU_reg[4].x = 0.5f;
+   CPU_reg[3].x = 1.25f;
+   PGXP_CPU_ADDU(runtime_zero_operands, 1, 0, 1);
+   if (CPU_reg[5].x != 1.75f)
+      fail("runtime-zero left ADD lost precision", 0, 1);
+}
+
+static void test_memory_zero_add_identity(void)
+{
+   const uint32_t instr = INSTR_RS(4) | INSTR_RD(5) | 0x21u;
+   const uint32_t zero_source = INSTR_RD(5) | 0x21u;
+   const uint32_t wrong_direction = INSTR_RT(4) | INSTR_RD(5) | 0x21u;
+   const uint32_t nonzero_rt = INSTR_RS(4) | INSTR_RT(3) |
+      INSTR_RD(5) | 0x21u;
+
+   CPU_reg[4] = PGXP_value_zero;
+   CPU_reg[5] = PGXP_value_zero;
+   SetValue(&CPU_reg[4], 0x00020001u);
+   CPU_reg[4].x = 1.25f;
+   CPU_reg[4].y = 2.5f;
+   PGXP_CPU_ADDU_Identity(instr, 0x00020001u, 0x00020001u);
+   if (CPU_reg[5].x != 1.25f || CPU_reg[5].y != 2.5f ||
+       CPU_reg[5].value != 0x00020001u)
+      fail("memory ADDU lost exact identity", CPU_reg[5].value,
+            0x00020001u);
+
+   CPU_reg[5] = PGXP_value_zero;
+   CPU_reg[5].x = 9.f;
+   PGXP_CPU_ADDU_Identity(wrong_direction, 0x00020001u, 0x00020001u);
+   if (CPU_reg[5].x != 9.f)
+      fail("left-zero ADDU was transported", 0, 1);
+
+   CPU_reg[5].x = 8.f;
+   PGXP_CPU_ADDU_Identity(nonzero_rt, 0x00020001u, 0x00020001u);
+   if (CPU_reg[5].x != 8.f)
+      fail("runtime-zero ADDU was transported", 0, 1);
+
+   CPU_reg[4].flags = VALID_01;
+   CPU_reg[4].value = 0x00040003u;
+   PGXP_CPU_ADDU_Identity(instr, 0x00020001u, 0x00020001u);
+   if (CPU_reg[5].flags & VALID_01)
+      fail("stale ADDU source stayed valid", CPU_reg[5].flags, 0);
+
+   CPU_reg[5] = PGXP_value_zero;
+   SetValue(&CPU_reg[5], 0);
+   CPU_reg[5].x = 9.f;
+   CPU_reg[5].y = 8.f;
+   CPU_reg[5].z = 7.f;
+   PGXP_CPU_ADDU_Identity(zero_source, 0, 0);
+   if (CPU_reg[5].value != 0 || CPU_reg[5].x != 0.f ||
+       CPU_reg[5].y != 0.f || CPU_reg[5].z != 0.f ||
+       (CPU_reg[5].flags & VALID_01) != VALID_01)
+      fail("zero-source ADDU retained stale precision",
+            CPU_reg[5].value, 0);
+}
+
 int main(void)
 {
    PGXP_Init();
@@ -291,6 +443,15 @@ int main(void)
 
    printf("[T5] negative control: CPU-composed colour must be refused\n");
    test_untracked_colour();
+
+   printf("[T6] NCLIP native magnitude preservation\n");
+   test_nclip_magnitude();
+
+   printf("[T7] architectural-zero ADD identity\n");
+   test_architectural_zero_add_identity();
+
+   printf("[T8] Memory Only right-zero ADDU identity\n");
+   test_memory_zero_add_identity();
 
    if (failures)
    {

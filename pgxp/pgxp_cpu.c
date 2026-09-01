@@ -265,6 +265,21 @@ void PGXP_CPU_ADD(uint32_t instr, uint32_t rdVal, uint32_t rsVal, uint32_t rtVal
 	Validate(&CPU_reg[rs(instr)], rsVal);
 	Validate(&CPU_reg[rt(instr)], rtVal);
 
+	/* Addition with the architectural zero register is an exact identity.
+	 * Preserve the complete other operand shadow instead of blending. */
+	if (rt(instr) == 0)
+	{
+		CPU_reg[rd(instr)] = CPU_reg[rs(instr)];
+		CPU_reg[rd(instr)].value = rdVal;
+		return;
+	}
+	if (rs(instr) == 0)
+	{
+		CPU_reg[rd(instr)] = CPU_reg[rt(instr)];
+		CPU_reg[rd(instr)].value = rdVal;
+		return;
+	}
+
 	/* iCB: Only require one valid input */
 	if (((CPU_reg[rt(instr)].flags & VALID_01) != VALID_01) != ((CPU_reg[rs(instr)].flags & VALID_01) != VALID_01))
 	{
@@ -301,6 +316,27 @@ void PGXP_CPU_ADDU(uint32_t instr, uint32_t rdVal, uint32_t rsVal, uint32_t rtVa
 {
 	/* Rd = Rs + Rt (signed) (unsafe?) */
 	PGXP_CPU_ADD(instr, rdVal, rsVal, rtVal);
+}
+
+void PGXP_CPU_ADDU_Identity(uint32_t instr, uint32_t rdVal, uint32_t rsVal)
+{
+	unsigned dest = rd(instr);
+	unsigned source = rs(instr);
+
+	/* This transport is intentionally limited to the architectural
+	 * `addu rd, rs, $zero` form established by device instrumentation. */
+	if (rt(instr) != 0 || dest == 0 || dest == source)
+		return;
+	if (source == 0)
+	{
+		CPU_reg[dest] = PGXP_value_zero;
+		SetValue(&CPU_reg[dest], rdVal);
+		return;
+	}
+
+	Validate(&CPU_reg[source], rsVal);
+	CPU_reg[dest] = CPU_reg[source];
+	CPU_reg[dest].value = rdVal;
 }
 
 void PGXP_CPU_SUB(uint32_t instr, uint32_t rdVal, uint32_t rsVal, uint32_t rtVal)

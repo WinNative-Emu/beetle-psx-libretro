@@ -1195,6 +1195,8 @@ static int32_t CPU_RunReal(PS_CPU *self, int32_t timestamp_in)
 
 	if (PGXP_GetModes() & PGXP_MODE_CPU)
 		PGXP_CPU_ADDU(instr, result, GPR[rs], GPR[rt]);
+	else if ((PGXP_GetModes() & PGXP_MODE_MEMORY) && rt == 0)
+		PGXP_CPU_ADDU_Identity(instr, result, GPR[rs]);
 
 	DO_LDS();
 
@@ -3050,16 +3052,25 @@ static void pgxp_cop2_notify(struct lightrec_state *state, uint32_t op, uint32_t
 }
 
 /* PGXP CPU-mode tracking hook for the lightrec recompiler.  Installed in
- * pgxp_ops.pgxp_cpu only while PGXP_MODE_CPU is active.  The recompiler calls
- * this after each tracked op with the post-execution register values; route
- * them to the unified PGXP_CPU dispatcher, which keeps CPU_reg[] precision
- * metadata up to date just as the interpreter's per-instruction hooks do. */
+ * pgxp_ops.pgxp_cpu only while PGXP_MODE_CPU is active.  lightrec calls
+ * this before each tracked non-memory op with the pre-op source values and
+ * the result it is about to produce, which is exactly what the
+ * interpreter's per-instruction hooks pass; route them to the unified
+ * PGXP_CPU dispatcher.  Loads and stores arrive through the memory-map
+ * ops (pgxp_nonhw_regs_ops / pgxp_hw_regs_ops) as in Memory Only mode. */
 static void pgxp_cpu_track(struct lightrec_state *state, uint32_t instr,
                            uint32_t rd, uint32_t rs, uint32_t rt,
                            uint32_t hi, uint32_t lo, uint32_t addr)
 {
 	(void)state;
 	PGXP_CPU_Dispatch(instr, rd, rs, rt, hi, lo, addr);
+}
+
+static void pgxp_addu_identity_track(struct lightrec_state *state,
+		uint32_t instr, uint32_t value)
+{
+	(void)state;
+	PGXP_CPU_ADDU_Identity(instr, value, value);
 }
 
 static bool cp2_ops[0x40] = {0,1,0,0,0,0,1,0,0,0,0,0,1,0,0,0,
@@ -3636,6 +3647,10 @@ static int lightrec_plugin_init(PS_CPU *self)
        * path after a mode change. */
       pgxp_ops.pgxp_cpu = (PGXP_GetModes() & PGXP_MODE_CPU)
                           ? pgxp_cpu_track : NULL;
+      pgxp_ops.pgxp_addu_identity =
+            (PGXP_GetModes() & PGXP_MODE_MEMORY) &&
+            !(PGXP_GetModes() & PGXP_MODE_CPU)
+            ? pgxp_addu_identity_track : NULL;
 
       cop_ops = &pgxp_ops;
    }

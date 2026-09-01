@@ -39,6 +39,7 @@ extern bool psx_gpu_rasterize_both_fields;
 extern int line_render_mode;
 extern int filter_mode;
 extern int crop_overscan;
+extern bool psx_pgxp_gl_line_expansion;
 
 enum core_timing_fps_modes
 {
@@ -54,7 +55,7 @@ extern uint8_t startup_frame_count;
 
 extern int aspect_ratio_setting;
 extern bool aspect_ratio_dirty;
-extern bool is_monkey_hero;
+extern bool gpu_fbwrite_fifo_delay;
 
 /* Output color format ("Color Format" core option).
  *

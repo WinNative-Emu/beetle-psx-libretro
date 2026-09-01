@@ -57,6 +57,13 @@ static inline u32 execute(lightrec_int_func_t func, struct interpreter *inter)
 
 static inline u32 lightrec_int_op(struct interpreter *inter)
 {
+	/* PGXP CPU-mode tracking: report non-memory ops before they
+	 * execute, mirroring the recompiler.  Loads and stores are
+	 * reported by the memory-map ops. */
+	if (unlikely(inter->state->ops.pgxp_cpu) &&
+	    lightrec_pgxp_cpu_tracked(inter->op->c))
+		lightrec_pgxp_cpu_track(inter->state, inter->op->c);
+
 	return execute(int_standard[inter->op->i.op], inter);
 }
 
@@ -879,8 +886,15 @@ static u32 int_special_ADD(struct interpreter *inter)
 	s32 rs = reg_cache[op->rs];
 	s32 rt = reg_cache[op->rt];
 
-	if (likely(op->rd))
+	if (likely(op->rd)) {
 		reg_cache[op->rd] = rs + rt;
+
+		if (op_flag_pgxp_addu_identity(inter->op->flags) &&
+		    inter->state->ops.pgxp_addu_identity)
+			(*inter->state->ops.pgxp_addu_identity)(
+					inter->state, inter->op->opcode,
+					reg_cache[op->rd]);
+	}
 
 	return jump_next(inter);
 }
@@ -980,9 +994,21 @@ static u32 int_META_MOV(struct interpreter *inter)
 {
 	u32 *reg_cache = inter->state->regs.gpr;
 	struct opcode_m *op = &inter->op->m;
+	union code identity = { .opcode = 0 };
 
-	if (likely(op->rd))
+	if (likely(op->rd)) {
 		reg_cache[op->rd] = reg_cache[op->rs];
+
+		if (op_flag_pgxp_addu_identity(inter->op->flags) &&
+		    inter->state->ops.pgxp_addu_identity) {
+			identity.r.op = OP_SPECIAL_ADDU;
+			identity.r.rs = op->rs;
+			identity.r.rd = op->rd;
+			(*inter->state->ops.pgxp_addu_identity)(
+					inter->state, identity.opcode,
+					reg_cache[op->rd]);
+		}
+	}
 
 	return jump_next(inter);
 }
