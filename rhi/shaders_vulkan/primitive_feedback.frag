@@ -48,7 +48,11 @@ void main()
 
 	vec4 color = NNColor;
 
-	vec3 shaded_hot = color.rgb * ((PGXP_FOG != 0) ? pgxp_fog_mix(vColor.rgb, vFog) : vColor.rgb) * (255.0 / 128.0);
+	/* Raw texture colour bypasses vertex modulation. The final store bias
+	 * remains below because this program emits a derived blended result. */
+	bool raw_texture = (uint(vParam.z) & 0x2000u) != 0u;
+	vec3 shaded_hot = raw_texture ? color.rgb :
+		color.rgb * ((PGXP_FOG != 0) ? pgxp_fog_mix(vColor.rgb, vFog) : vColor.rgb) * (255.0 / 128.0);
 	vec3 shaded     = clamp(shaded_hot, 0.0, 1.0);
 	vec3 add_src    = (HDR_HOT_SOURCE != 0) ? max(shaded_hot, vec3(0.0)) : shaded;
 	float blend_amt = NNColor.a;
@@ -79,7 +83,9 @@ void main()
 		 * target does not, and a negative residue both diverges from
 		 * hardware and dims every later additive draw over the same pixels
 		 * (dark halos around subtractive effects). No-op on UNORM. */
-		blended = mix(shaded, max(fbcolor.rgb - add_src, vec3(0.0)), blend_amt);
+		/* ...and subtracts from a SATURATED destination: stacked additive layers
+		 * may exceed white on the 16F target, hardware clamped each one at white. */
+		blended = mix(shaded, max(min(fbcolor.rgb, vec3(1.0)) - add_src, vec3(0.0)), blend_amt);
 	if (BLEND_MODE == BLEND_ADD_QUARTER)
 		blended = mix(shaded, clamp(shaded, 0.0, 1.0) * 0.25 + fbcolor.rgb, blend_amt);
 
@@ -93,7 +99,12 @@ void main()
 	// This is required for various "fade" out effects.
 	// However, don't accidentially round down if we are already rounded to avoid
 	// unintended feedback effects.
-	FragColor.rgb -= 0.49 / 255.0;
+	/* Floor at zero: an 8-bit UNORM target clamps the bias to 0 on store, but
+	 * the 16F HDR target keeps it, turning flat black into -0.49/255. A game
+	 * that samples its own render output then sees black != 0x0000, so a
+	 * transparent texel draws opaque (e.g. SotN render-to-texture deaths).
+	 * No-op on UNORM, which clamps the fragment output to [0,1] anyway. */
+	FragColor.rgb = max(FragColor.rgb - 0.49 / 255.0, vec3(0.0));
 
 #if 0
 #if defined(TEXTURED)

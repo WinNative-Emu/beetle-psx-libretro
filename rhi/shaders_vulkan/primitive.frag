@@ -118,6 +118,18 @@ void main()
 	if (opacity < 0.5)
 		discard;
 
+#ifdef CEILING
+	/* HDR ceiling pass: same coverage as the subtractive draw that follows
+	 * (same discards, same depth test); MIN-blended so the destination is
+	 * clamped to white exactly where the hardware's saturated value would be
+	 * subtracted from. */
+	FragColor = vec4(1.0);
+	return;
+#endif
+
+	/* 0x2000 carries the GP0 raw-texture bit. Do not infer this from a
+	 * neutral vertex colour: 0x808080 is also valid modulated input. */
+	bool raw_texture = (uint(vParam.z) & 0x2000u) != 0u;
 	bool fixed_feedback = (uint(vParam.z) & 0x800u) != 0u;
 	if (fixed_feedback)
 	{
@@ -151,7 +163,8 @@ void main()
 		FragColor = vec4(q5 / 31.0, NNColor.a + vColor.a);
 		return;
 	}
-	vec3 shaded_hot = color.rgb * ((PGXP_FOG != 0) ? pgxp_fog_mix(vColor.rgb, vFog) : vColor.rgb) * (255.0 / 128.0);
+	vec3 shaded_hot = raw_texture ? color.rgb :
+		color.rgb * ((PGXP_FOG != 0) ? pgxp_fog_mix(vColor.rgb, vFog) : vColor.rgb) * (255.0 / 128.0);
 	vec3 shaded = clamp(shaded_hot, 0.0, 1.0);
 	/* The semi-trans-opaque pass and every other blend mode stay clamped;
 	 * over-white there comes only from stacking, matching the option text. */
@@ -163,6 +176,14 @@ void main()
 		shaded = max(shaded_hot, vec3(0.0));
 	FragColor = vec4(shaded, NNColor.a + vColor.a);
 #else
+#ifdef CEILING
+	/* HDR ceiling pass: same coverage as the subtractive draw that follows
+	 * (same discards, same depth test); MIN-blended so the destination is
+	 * clamped to white exactly where the hardware's saturated value would be
+	 * subtracted from. */
+	FragColor = vec4(1.0);
+	return;
+#endif
 	FragColor = vec4((PGXP_FOG != 0) ? pgxp_fog_mix(vColor.rgb, vFog) : vColor.rgb, vColor.a);
 #endif
 
@@ -170,7 +191,18 @@ void main()
 	// This is required for various "fade" out effects.
 	// However, don't accidentially round down if we are already rounded to avoid
 	// unintended feedback effects.
-	FragColor.rgb -= 0.49 / 255.0;
+	/* Raw texture colour is already quantized by the PlayStation GPU. The
+	 * generic store bias can move it across a later 1555 packing boundary.
+	 * Floor the biased result at zero: an 8-bit UNORM target clamps the bias
+	 * to 0 on store, but the 16F HDR target keeps it, turning flat black into
+	 * -0.49/255. A game that samples its own render output then sees black
+	 * != 0x0000, so a transparent texel draws opaque (e.g. SotN
+	 * render-to-texture deaths). No-op on UNORM, which clamps the fragment
+	 * output to [0,1] anyway. */
+#ifdef TEXTURED
+	if (!raw_texture)
+#endif
+		FragColor.rgb = max(FragColor.rgb - 0.49 / 255.0, vec3(0.0));
 
 #if 0
 #if defined(TEXTURED)
