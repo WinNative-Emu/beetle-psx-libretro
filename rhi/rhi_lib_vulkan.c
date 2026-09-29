@@ -71,11 +71,9 @@ extern int   psx_pgxp_fog;             /* PGXP linear-light depth cue; effective
  * pass after each subtractive batch. Both floor at zero; see
  * renderer_semi_trans_needs_feedback / renderer_emit_sub_floor. */
 extern int   psx_hdr_multipass;
-/* The requested color format (enum psx_color_format_e). Unlike psx_hdr_active
- * this is known at renderer init (read at startup), so it gates the wide
- * (16F) scaled framebuffer, which is allocated before HDR negotiation
- * completes. Non-zero = a 30-bit/HDR format was requested. */
-extern int   psx_color_format;
+/* Opt-in native 15-bit colour rendering (core option). Selects write-time
+ * RGB5 quantisation of every GP0 write on the SDR target. */
+extern int   psx_native_color;
 /* Frontend save directory (libretro.c); the persistent pipeline cache lives
  * under it because it is the one directory the core already writes to. */
 extern char  retro_save_directory[4096];
@@ -1522,7 +1520,8 @@ static IntrusivePODWrapperPipeline *vk_pipeline_map_emplace_yield(
    enum VendorID
    {
       VENDOR_ID_NVIDIA = 0x10de,
-      VENDOR_ID_ARM = 0x13b5
+      VENDOR_ID_ARM = 0x13b5,
+      VENDOR_ID_QUALCOMM = 0x5143
    };
    typedef enum VendorID VendorID;
 
@@ -1598,6 +1597,11 @@ static bool context_is_valid(const struct Context *self) { return self->valid; }
    struct ImplementationWorkarounds
    {
       bool optimize_all_graphics_barrier;
+      /* Adreno renders overlapping fixed-function-blended primitives out of
+       * order within a single draw under native colour (object-local
+       * flashes in Jumping Flash). Vulkan guarantees primitive order for
+       * blending, so only Qualcomm pays the per-primitive draw split. */
+      bool split_native_semi_trans_draws;
    };
 
    /* TextureFormatLayout: computes mip/layer byte layout for a texture upload
@@ -4952,6 +4956,7 @@ static void cbh_move(struct CommandBufferHandle *dst,
    {
       /* srcStageMask = ALL_GRAPHICS_BIT causes some weird stalls compared to waiting for fragment only. */
       self->workarounds.optimize_all_graphics_barrier = self->gpu_props.vendorID == VENDOR_ID_ARM;
+      self->workarounds.split_native_semi_trans_draws = self->gpu_props.vendorID == VENDOR_ID_QUALCOMM;
    }
 
    /* Device inline accessors (batch 4), converted from in-class member
@@ -5425,6 +5430,7 @@ static struct PrimitiveInfo primitive_info_make(
       SemiTransparentMode semi_transparent;
       bool textured;
       bool masked;
+      bool native_color;
       bool filtering;
       bool scaled_read;
       unsigned shift;
@@ -5437,6 +5443,7 @@ static bool semi_transparent_state_eq(const struct SemiTransparentState *a,
    {
       return a->scissor_index == b->scissor_index && hd_handle_eq(&a->hd_texture_index, &b->hd_texture_index) &&
          a->semi_transparent == b->semi_transparent && a->textured == b->textured && a->masked == b->masked &&
+         a->native_color == b->native_color &&
          a->filtering == b->filtering && a->scaled_read == b->scaled_read && a->shift == b->shift &&
          a->offset_uv == b->offset_uv;
    }
@@ -5608,10 +5615,13 @@ static bool semi_transparent_state_eq(const struct SemiTransparentState *a,
       ScanoutMode scanout_mode;
       ScanoutFilter scanout_filter;
       ScanoutFilter scanout_mdec_filter;
+      /* Frame-latched native-colour configuration. The first flag selects
+       * native versus internal-resolution dither spacing; the second selects
+       * RGB5 write-time storage independently of each primitive's DTD bit. */
       bool dither_native_resolution;
-      /* The dtd bit of the primitive being queued (from the push_*
-       * entry points). Feeds the fixed-point framebuffer-feedback
-       * modulation path; the scanout-level dither is separate. */
+      bool native_color;
+      /* The DTD bit of the primitive being queued (from the push_* entry
+       * points). Feeds fixed-point modulation and native RGB5 writes. */
       bool primitive_dither;
       bool force_mask_bit;
       bool texture_color_modulate;
@@ -5667,6 +5677,7 @@ static void render_state_init(struct RenderState *s)
    s->scanout_filter = ScanoutFilter_None;
    s->scanout_mdec_filter = ScanoutFilter_None;
    s->dither_native_resolution = false;
+   s->native_color = false;
    s->force_mask_bit = false;
    s->texture_color_modulate = false;
    s->mask_test = false;
@@ -6779,12 +6790,14 @@ static void renderer_init(Renderer *self,
 
    info.width *= self->scaling;
    info.height *= self->scaling;
-   /* Decide the scaled-framebuffer colour format. Widen to 16F only when a
-    * 30-bit/HDR format was requested AND the device supports R16F for every
-    * usage the scaled fb needs (colour attachment, sampled, storage). SDR and
-    * unsupported GPUs keep R8G8B8A8 and render exactly as before. */
+   /* Decide the scaled-framebuffer colour format. HDR negotiation completes
+    * after SET_HW_RENDER and before the frontend invokes context_reset, so its
+    * accepted result is authoritative here. Widen to 16F only when HDR is
+    * engaged AND the device supports R16F for every usage the scaled fb needs
+    * (colour attachment, sampled, storage). SDR and rejected/unsupported HDR
+    * keep R8G8B8A8 and render exactly as before. */
    self->scaled_fb_format = VK_FORMAT_R8G8B8A8_UNORM;
-   if (psx_color_format != 0 &&
+   if (psx_hdr_active &&
          device_image_format_is_supported(self->device, VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
             VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
@@ -8515,7 +8528,8 @@ static ImageHandle renderer_scanout_to_texture(Renderer *self)
          display_rect.height * render_scale,
          analog ? VK_FORMAT_R16G16B16A16_SFLOAT
          : hdr_quad ? renderer_hdr_scanout_format(self)
-            : (self->render_state.scanout_mode == ScanoutMode_ABGR1555_Dither ? VK_FORMAT_A1R5G5B5_UNORM_PACK16 : VK_FORMAT_R8G8B8A8_UNORM));
+            : (self->render_state.scanout_mode == ScanoutMode_ABGR1555_Dither &&
+               !self->render_state.native_color ? VK_FORMAT_A1R5G5B5_UNORM_PACK16 : VK_FORMAT_R8G8B8A8_UNORM));
 
    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -8565,7 +8579,11 @@ static ImageHandle renderer_scanout_to_texture(Renderer *self)
     * 30-bit output exists to avoid 15-bit quantisation; re-imposing it to feed
     * the cable trades the precision the user asked for against an artifact. So
     * HDR suppresses the dither with a cable exactly as it does without one. */
-   dither = (self->render_state.scanout_mode == ScanoutMode_ABGR1555_Dither) && !psx_hdr_active;
+   /* Native-colour rendering has already applied the GP0 primitive's DTD bit
+    * and stored RGB5. Applying this display-wide pass as well would dither and
+    * quantize the image a second time. */
+   dither = (self->render_state.scanout_mode == ScanoutMode_ABGR1555_Dither) &&
+      !self->render_state.native_color && !psx_hdr_active;
 
    if (bpp24)
    {
@@ -9067,6 +9085,21 @@ static bool renderer_ensure_scaled_read_snapshot(Renderer *self)
    return true;
 }
 
+static bool vertices_have_neutral_modulation(const Vertex *vertices,
+      unsigned count)
+{
+   const float neutral = 128.0f / 255.0f;
+   unsigned i;
+
+   for (i = 0; i < count; i++)
+      if (vertices[i].cf[0] != neutral ||
+          vertices[i].cf[1] != neutral ||
+          vertices[i].cf[2] != neutral)
+         return false;
+
+   return true;
+}
+
 static void renderer_build_attribs(Renderer *self, BufferVertex *output, const Vertex *vertices, unsigned count, HdTextureHandle *hd_texture_index_out,
    bool *filtering_out, bool *scaled_read_out, unsigned *shift_out, bool *offset_uv_out){
       int16_t param;
@@ -9205,7 +9238,29 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
    else
    {
       filtering = self->render_state.texture_mode != TextureMode_None;
-      scaled_read = false;
+      if (self->render_state.texture_mode != TextureMode_None)
+      {
+         TTRect sampled_vram = hd_texture_vram;
+         TTRect palette_rect = {
+            self->render_state.palette_offset_x,
+            self->render_state.palette_offset_y,
+            self->render_state.texture_mode == TextureMode_Palette8bpp ? 256u : 16u,
+            1
+         };
+         bool texture_rendered;
+
+         /* Keep packed 4/8bpp texture words in the native path when they were
+          * themselves rendered. If only the live CLUT was rendered, however,
+          * read the scaled domain so its colour is not quantized through a
+          * scaled-to-native resolve before the palette lookup. */
+         if (sampled_vram.height && !sampled_vram.width)
+            sampled_vram.width = 1;
+         texture_rendered = fbatlas_texture_rendered(&self->atlas, &sampled_vram);
+         scaled_read = !texture_rendered &&
+               fbatlas_texture_rendered(&self->atlas, &palette_rect);
+      }
+      else
+         scaled_read = false;
    }
    if (scaled_read && !renderer_ensure_scaled_read_snapshot(self))
       scaled_read = false;
@@ -9243,33 +9298,20 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
          /* All UVs are within a single hd texture, and there are no & or | shenanigans. Tell the shader to use the fast path. */
          param = param | 0x100;
       }
-      if (cache_hit) {
-         param = param | 0x400; /* dbg cache hit */
-      }
    }
    if (hd_handle_is_none(&hd_texture_index)) {
       /* This flag says skip hd textures */
       param = param | 0x200;
    }
 
-   /* Fixed-point framebuffer-feedback modulation (Vulkan port of the GL
-    * change): when the sampled texture or palette contains GPU-rendered
-    * VRAM data, route modulation through the PlayStation GPU's own
-    * fixed-point order in the shader so repeated feedback decays at
-    * hardware rate instead of the float path's slower fade. Disabled
-    * under PGXP precise colour, matching the GL gate. 0x8000 is masked
-    * as unsigned in the shader because params is a signed 16-bit lane. */
-   /* Restored: the gate-drop shipped for the Tomb Raider 2 water made
-    * the title worse, not better. The water surface samples the
-    * framebuffer as a 4bpp CLUT texture (screen-space refraction); on
-    * the reporter's configuration GL renders it correctly with this
-    * same gate CLOSED - its float path plus working same-frame
-    * fb-to-texture synchronization - so quantizing those draws was
-    * never the fix, and unleashing 5-bit quantization plus dither on
-    * them produced white output with dither speckle. The real defect
-    * is Vulkan-side stale unscaled-domain content under the sampled
-    * rect, tracked separately. */
-   if (!psx_pgxp_color &&
+   /* Framebuffer feedback samples authoritative 15-bit VRAM even when the
+    * render target is wide. Direct-colour feedback needs RGB5 modulation at
+    * any shade, including Silent Hill's 0x7f fade sprites. For indexed
+    * textures under precise colour, retain the all-vertex neutral test so a
+    * genuinely shaded texture such as Tomb Raider 2's water stays wide. */
+   if ((!psx_pgxp_color ||
+        self->render_state.texture_mode == TextureMode_ABGR1555 ||
+        vertices_have_neutral_modulation(vertices, count)) &&
        self->render_state.texture_color_modulate &&
        self->render_state.texture_mode != TextureMode_None &&
        hd_texture_vram.height > 0)
@@ -9302,6 +9344,17 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
    }
    if (self->render_state.primitive_dither)
       param = (int16_t)((uint16_t)param | 0x8000u);
+   if (self->render_state.native_color)
+   {
+      /* 0x0400 (formerly an unconsumed cache-hit debug marker) selects native
+       * RGB5 storage; 0x4000 selects a 4x4 dither pattern in native PS1 pixels
+       * instead of internal-resolution pixels. Both are authoritative frame
+       * configuration, while 0x8000 above is the individual primitive's GP0
+       * DTD bit. */
+      param = (int16_t)((uint16_t)param | 0x0400u);
+      if (self->render_state.dither_native_resolution)
+         param = (int16_t)((uint16_t)param | 0x4000u);
+   }
 
    { unsigned i; for (i = 0; i < count; i++) {
       output[i].x = x[i];
@@ -9547,6 +9600,7 @@ static void renderer_draw_triangle(Renderer *self, const Vertex *vertices)
          SemiTransparentState _sts = { scissor_index, hd_texture_index, self->render_state.semi_transparent,
                                                self->render_state.texture_mode != TextureMode_None,
                                                self->render_state.mask_test,
+                                               self->render_state.native_color,
                                                filtering,
                                                scaled_read,
                                      shift,
@@ -9607,6 +9661,7 @@ static void renderer_draw_quad(Renderer *self, const Vertex *vertices)
          scissor_index, hd_texture_index, self->render_state.semi_transparent,
          self->render_state.texture_mode != TextureMode_None,
          self->render_state.mask_test,
+         self->render_state.native_color,
          filtering,
          scaled_read,
          shift,
@@ -10058,6 +10113,7 @@ static void renderer_render_opaque_primitives(Renderer *self){
    commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS);
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
+   commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 3, 0, VK_FORMAT_R16G16B16A16_SINT, offsetof(BufferVertex, pal_x));
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, fog));
    renderer_set_opaque_primitive_spec_constants(self, TransMode_Opaque);
    commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
@@ -10098,24 +10154,51 @@ static void renderer_hd_texture_uniforms(Renderer *self,
    hd.texture = NULL;
 }
 
-/* True when a semi-transparent prim must go through the programmable-blend
- * feedback program (input attachment + per-primitive by-region barrier)
- * rather than fixed-function blending. Masked prims always do. Non-masked
- * subtractive prims additionally do on the 16F HDR target: fixed-function
- * REVERSE_SUBTRACT cannot floor the result at zero on a float attachment,
- * and hardware clamps B - F at 0 per channel. The feedback program applies
- * the floor in-shader (see primitive_feedback.frag) with the check-mask
- * test disabled via SpecConstIndex_MaskTest. */
+/* True when a semi-transparent prim uses the programmable-blend feedback
+ * program. Native-colour average and quarter-add need post-blend RGB5
+ * truncation; fixed-function RGBA8 blending cannot provide it. Native-colour
+ * Add and Sub sources, including raw texture samples, are quantized before
+ * blending by primitive.frag, so fixed Add/Sub preserve RGB5 results (with
+ * 255 representing saturation). Keep the existing masked textured Add route, but leave masked
+ * flat Add on the fixed path: its input-attachment read causes full-screen
+ * flashes on the tested Adreno GPU. */
 static bool renderer_semi_trans_needs_feedback(const Renderer *self,
       const SemiTransparentState *state)
 {
    if (state->semi_transparent == SemiTransparentMode_None)
       return false;
-   if (state->masked)
-      return true;
-   return psx_hdr_multipass &&
-      state->semi_transparent == SemiTransparentMode_Sub &&
-      self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT;
+   switch (state->semi_transparent)
+   {
+   case SemiTransparentMode_Add:
+      return state->masked && (!state->native_color || state->textured);
+   case SemiTransparentMode_Average:
+   case SemiTransparentMode_AddQuarter:
+      return state->masked || state->native_color;
+   case SemiTransparentMode_Sub:
+      /* Native-colour subtract is exact on the fixed path: primitive.frag
+       * has already stored the source as an RGB5 multiple of 8, the
+       * destination is one too, and REVERSE_SUBTRACT floors at zero on
+       * UNORM. No post-blend truncation is needed, so do not pay the
+       * per-primitive feedback barrier for it. */
+      return state->masked ||
+         (psx_hdr_multipass &&
+          self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT);
+   default:
+      return false;
+   }
+}
+
+/* Program selection and draw ordering are separate decisions. Feedback
+ * reads always need a draw boundary per primitive. Native-colour draws on
+ * the fixed path only need one on Adreno (see ImplementationWorkarounds);
+ * everywhere else they batch exactly as standard-colour draws do. */
+static bool renderer_semi_trans_needs_separate_draw(const Renderer *self,
+      const SemiTransparentState *state)
+{
+   return (state->native_color &&
+         state->semi_transparent != SemiTransparentMode_None &&
+         device_get_workarounds(self->device)->split_native_semi_trans_draws) ||
+      renderer_semi_trans_needs_feedback(self, state);
 }
 
 /* With multipass off, the same prims stay on fixed-function
@@ -10246,10 +10329,9 @@ static void renderer_render_semi_transparent_primitives(Renderer *self){
    /* These pixels are blended, so we have to render them in-order.
     * Batch up as long as we can. */
    { unsigned i; for (i = 1; i < prims; i++) {
-      /* If we need programmable shading, we can't batch as primitives may
-       * overlap. We could in theory do some fancy tests here, but probably
-       * overkill here. */
-      if (renderer_semi_trans_needs_feedback(self, &last_state) ||
+      /* Preserve per-primitive boundaries for feedback reads and native-
+       * colour draws; later primitives may overlap earlier ones. */
+      if (renderer_semi_trans_needs_separate_draw(self, &last_state) ||
           !semi_transparent_state_eq(&last_state, SemiTransparentStateVec_at(&self->queue.semi_transparent_state, i)))
       {
          unsigned to_draw = i - last_draw_offset;
@@ -10880,7 +10962,11 @@ static void renderer_semi_transparent_set_state(Renderer *self,
    }
    case SemiTransparentMode_Add:
    {
-      if (state->masked)
+      /* Native-colour Add sources are reduced to RGB5 before blending,
+       * including raw texture samples. Fixed-function addition preserves
+       * the RGB5 sum; destination alpha can suppress a masked flat source.
+       * Retain feedback for masked textured Add as before. */
+      if (renderer_semi_trans_needs_feedback(self, state))
       {
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAdd);
          commandbuffer_set_program(cbh_get(&self->cmd), textured_masked);
@@ -10903,14 +10989,20 @@ static void renderer_semi_transparent_set_state(Renderer *self,
          commandbuffer_set_program(cbh_get(&self->cmd), textured);
          commandbuffer_set_blend_enable(cbh_get(&self->cmd), true);
          commandbuffer_set_blend_op(cbh_get(&self->cmd), VK_BLEND_OP_ADD, VK_BLEND_OP_ADD);
-         commandbuffer_set_blend_factors(cbh_get(&self->cmd), VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
-                                VK_BLEND_FACTOR_ZERO);
+         if (state->masked)
+            commandbuffer_set_blend_factors(cbh_get(&self->cmd),
+                  VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
+                  VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE);
+         else
+            commandbuffer_set_blend_factors(cbh_get(&self->cmd),
+                  VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
+                  VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO);
       }
       break;
    }
    case SemiTransparentMode_Average:
    {
-      if (state->masked)
+      if (renderer_semi_trans_needs_feedback(self, state))
       {
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAvg);
          commandbuffer_set_program(cbh_get(&self->cmd), textured_masked);
@@ -10977,7 +11069,7 @@ static void renderer_semi_transparent_set_state(Renderer *self,
    }
    case SemiTransparentMode_AddQuarter:
    {
-      if (state->masked)
+      if (renderer_semi_trans_needs_feedback(self, state))
       {
          commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_BlendMode, BlendMode_BlendAddQuarter);
          commandbuffer_set_program(cbh_get(&self->cmd), textured_masked);
@@ -20480,6 +20572,15 @@ void rhi_vulkan_prepare_frame(void)
    renderer->primitive_filter_mode = (FilterMode)(filter_mode);
    renderer->sprite_filter_exclude = (FilterExclude)(filter_exclude_sprites);
    renderer->polygon_2d_filter_exclude = (FilterExclude)(filter_exclude_2d_polygons);
+   /* Latch the negotiated mode at the frame boundary before any GP0 work is
+    * queued. Native colour is an explicit opt-in: it is not implied by the
+    * dither option (which still only selects the per-primitive dither
+    * pattern and the display-level downsample), and engaged HDR always
+    * keeps its higher-precision path. */
+   renderer->render_state.native_color =
+      !psx_hdr_active && psx_native_color != 0;
+   renderer->render_state.dither_native_resolution =
+      dither_mode == DITHER_NATIVE;
 }
 
 static ScanoutMode get_scanout_mode(bool bpp24)
@@ -20558,7 +20659,6 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
     * the config above so it picks the right rect/pages folder). */
    texture_tracker_ensure_directories(renderer->tracker, dump_textures, replace_textures);
    renderer->render_state.adaptive_smoothing = adaptive_smoothing;
-   renderer->render_state.dither_native_resolution = dither_mode == DITHER_NATIVE;
    renderer->render_state.crop_overscan = vulkan_crop_overscan;
    renderer->render_state.offset_cycles = image_offset_cycles;
    renderer_set_visible_scanlines(renderer, initial_scanline, last_scanline, initial_scanline_pal, last_scanline_pal);
