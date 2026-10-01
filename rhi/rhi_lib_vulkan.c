@@ -4723,6 +4723,13 @@ static void cbh_move(struct CommandBufferHandle *dst,
          VkQueue graphics_queue;
          VkQueue compute_queue;
          VkQueue transfer_queue;
+         /* The queue this device shares with the frontend, and the
+          * frontend's lock for it (retro_hw_render_interface_vulkan's
+          * lock_queue / unlock_queue). See device_set_frontend_queue. */
+         VkQueue frontend_queue;
+         void (*frontend_queue_lock)(void *handle);
+         void (*frontend_queue_unlock)(void *handle);
+         void *frontend_queue_handle;
          VkPipelineCache pipeline_cache;
          /* Persistent pipeline cache bookkeeping: CRC/size of the blob last
           * read from or written to disk (so an unchanged blob is not
@@ -15747,11 +15754,18 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
 
    static void context_destroy(struct Context *self)
    {
-      if (self->device != VK_NULL_HANDLE)
-         vkDeviceWaitIdle(self->device);
-
+      /* Only a device this context still owns. One released to the
+       * frontend (context_release_device) is the frontend's: its queue
+       * is in use on the frontend's threads, the Device has already
+       * drained this core's work on it in device_deinit, and when this
+       * runs for a stale context at the next create_device the frontend
+       * has destroyed the device already. Waiting on it was a use of a
+       * queue that is not ours, or of a device that is gone. */
       if (self->owned_device && self->device != VK_NULL_HANDLE)
+      {
+         vkDeviceWaitIdle(self->device);
          vkDestroyDevice(self->device, NULL);
+      }
    }
 
    static bool context_create_device(struct Context *self, VkPhysicalDevice gpu, VkSurfaceKHR surface, const char **required_device_extensions,
@@ -16956,6 +16970,48 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       }
    }
 
+   /* The frontend's queue.
+    *
+    * The graphics queue this device submits to is the one handed to the
+    * frontend in libretro_create_device, and the frontend submits its own
+    * frames and presents on it. A VkQueue must not be used by two threads
+    * at once, and under threaded video the frontend's use is on its video
+    * thread while this device's is on the core's thread. The interface
+    * has a lock for exactly that (lock_queue / unlock_queue), every core
+    * that submits for itself is required to take it around its queue
+    * access, and this one never did: the two threads' submissions raced
+    * on the queue, and both ended up waiting on fences that did not
+    * signal.
+    *
+    * It is taken around vkQueueSubmit itself and nothing else - never
+    * across a wait of any kind, see device_wait_queues_idle - and only
+    * for the queue the frontend has. The
+    * compute and transfer queues are this device's own where the GPU has
+    * separate ones, and are compared by handle so that where they alias
+    * the graphics queue they take it too. */
+   static void device_set_frontend_queue(Device *self, VkQueue queue,
+         void (*lock)(void *handle), void (*unlock)(void *handle), void *handle)
+   {
+      self->frontend_queue        = (lock && unlock) ? queue : VK_NULL_HANDLE;
+      self->frontend_queue_lock   = lock;
+      self->frontend_queue_unlock = unlock;
+      self->frontend_queue_handle = handle;
+   }
+
+   static INLINE bool device_queue_lock(Device *self, VkQueue queue)
+   {
+      if (self->frontend_queue == VK_NULL_HANDLE || queue != self->frontend_queue)
+         return false;
+      self->frontend_queue_lock(self->frontend_queue_handle);
+      return true;
+   }
+
+   static INLINE void device_queue_unlock(Device *self, bool locked)
+   {
+      if (locked)
+         self->frontend_queue_unlock(self->frontend_queue_handle);
+   }
+
    static void device_submit_nolock(Device *self,
          CommandBufferHandle cmd,
          Fence *fence,
@@ -17053,7 +17109,9 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       }
 
       cleared_fence = fence ? fencemanager_request_cleared_fence(&self->managers.fence) : VK_NULL_HANDLE;
+      { bool queue_locked = device_queue_lock(self, queue);
       result = vkQueueSubmit(queue, 1, &submit, cleared_fence);
+      device_queue_unlock(self, queue_locked); }
 
       if (result != VK_SUCCESS)
          LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
@@ -17328,7 +17386,9 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
             break;
       }
 
+      { bool queue_locked = device_queue_lock(self, queue);
       result = vkQueueSubmit(queue, VkSubmitInfoVec_size(&submits), VkSubmitInfoVec_data(&submits), cleared_fence);
+      device_queue_unlock(self, queue_locked); }
       if (result != VK_SUCCESS)
          LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
       cbhvec_clear(submissions);
@@ -17633,13 +17693,75 @@ static void device_clear_wait_semaphores(Device *self)
    VkPipelineStageVec_clear(&self->transfer.wait_stages);
 }
 
+/* Wait until everything submitted so far, on every queue this device
+ * uses, has been executed.
+ *
+ * This was vkDeviceWaitIdle. That call is a use of every queue of the
+ * device, the frontend's included, so it needs the frontend's queue lock -
+ * and then the lock is held for as long as the GPU takes to drain, with
+ * the frontend's video thread parked behind it. A lock held across a wait
+ * is how the two ends of a queue come to wait on each other.
+ *
+ * A fence submitted with no batches signals once all work submitted to
+ * that queue before it has completed, which is the same guarantee for
+ * that queue. So each queue gets one: the lock is taken for the submit
+ * call where the queue is the frontend's, and the wait is on the fences
+ * with nothing held. Work the frontend submitted earlier on the shared
+ * queue is covered exactly as it was. */
+static void device_wait_queues_idle(Device *self)
+{
+   VkQueue  queues[3];
+   VkFence  fences[3];
+   unsigned num_queues = 0;
+   unsigned num_fences = 0;
+   unsigned i;
+   VkFenceCreateInfo info = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+
+   if (self->device == VK_NULL_HANDLE)
+      return;
+
+   if (self->graphics_queue != VK_NULL_HANDLE)
+      queues[num_queues++] = self->graphics_queue;
+   if (     self->compute_queue != VK_NULL_HANDLE
+         && self->compute_queue != self->graphics_queue)
+      queues[num_queues++] = self->compute_queue;
+   if (     self->transfer_queue != VK_NULL_HANDLE
+         && self->transfer_queue != self->graphics_queue
+         && self->transfer_queue != self->compute_queue)
+      queues[num_queues++] = self->transfer_queue;
+
+   for (i = 0; i < num_queues; i++)
+   {
+      VkFence  fence = VK_NULL_HANDLE;
+      VkResult result;
+      bool     queue_locked;
+
+      if (vkCreateFence(self->device, &info, NULL, &fence) != VK_SUCCESS)
+         continue;
+      queue_locked = device_queue_lock(self, queues[i]);
+      result       = vkQueueSubmit(queues[i], 0, NULL, fence);
+      device_queue_unlock(self, queue_locked);
+      if (result == VK_SUCCESS)
+         fences[num_fences++] = fence;
+      else
+      {
+         LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
+         vkDestroyFence(self->device, fence, NULL);
+      }
+   }
+
+   if (num_fences)
+      vkWaitForFences(self->device, num_fences, fences, VK_TRUE, UINT64_MAX);
+   for (i = 0; i < num_fences; i++)
+      vkDestroyFence(self->device, fences[i], NULL);
+}
+
 static void device_wait_idle_nolock(Device *self)
 {
    if (self->per_frame.count != 0)
       device_end_frame_nolock(self);
 
-   if (self->device != VK_NULL_HANDLE)
-      vkDeviceWaitIdle(self->device);
+   device_wait_queues_idle(self);
 
    device_clear_wait_semaphores(self);
 
@@ -19957,6 +20079,13 @@ static void vk_context_reset(void)
     * reset is idempotent, mirroring the GL backend (gl_context_destroy fully
     * resets state before gl_context_reset rebuilds). The context itself is
     * owned by libretro_create_device, not by reset, so it is preserved. */
+   /* The stale device below still names the interface of the reset before
+    * this one, whose handle may be gone with the driver that gave it; its
+    * teardown waits the device idle, so it takes the queue lock through
+    * the interface just fetched. */
+   if (device)
+      device_set_frontend_queue(device, vulkan->queue,
+            vulkan->lock_queue, vulkan->unlock_queue, vulkan->handle);
    if (renderer)
    {
       renderer_fini(renderer);
@@ -19972,6 +20101,10 @@ static void vk_context_reset(void)
 
    device = (Device *)malloc(sizeof(Device));
    device_init(device);
+   /* Before the device touches a queue: device_set_context already
+    * waits the device idle, and renderer_init submits. */
+   device_set_frontend_queue(device, vulkan->queue,
+         vulkan->lock_queue, vulkan->unlock_queue, vulkan->handle);
    device_set_context(device, *&context);
 
    renderer = (Renderer *)malloc(sizeof(Renderer));
