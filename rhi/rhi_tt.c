@@ -1537,6 +1537,10 @@ static void RestorableRectSaveStateVec_free_storage(struct RestorableRectSaveSta
       TextureRectSaveStateVec rects;
       RestorableRectSaveStateVec restorable;
       UploadOwningMap uploads;
+      /* Copy of the tracker's CPU VRAM mirror (FB_WIDTH x FB_HEIGHT), or
+       * NULL. Page-aligned hashes and the CLUT fallback read the mirror, and
+       * a rebuilt tracker starts with a zeroed one. */
+      uint16_t *vram_mirror;
    };
 
    static INLINE void tts_init(struct TextureTrackerSaveState *s)
@@ -1544,6 +1548,7 @@ static void RestorableRectSaveStateVec_free_storage(struct RestorableRectSaveSta
       TextureRectSaveStateVec_init(&s->rects);
       RestorableRectSaveStateVec_init(&s->restorable);
       uploadmap_init(&s->uploads);
+      s->vram_mirror = NULL;
    }
 
    static INLINE void tts_destroy(struct TextureTrackerSaveState *s)
@@ -1551,6 +1556,8 @@ static void RestorableRectSaveStateVec_free_storage(struct RestorableRectSaveSta
       TextureRectSaveStateVec_free_storage(&s->rects);
       RestorableRectSaveStateVec_free_storage(&s->restorable);
       uploadmap_destroy(&s->uploads);
+      free(s->vram_mirror);
+      s->vram_mirror = NULL;
    }
 
    /* Move o into s (which must already be initialized): free s's current
@@ -1564,10 +1571,13 @@ static void RestorableRectSaveStateVec_free_storage(struct RestorableRectSaveSta
       TextureRectSaveStateVec_free_storage(&s->rects);
       RestorableRectSaveStateVec_free_storage(&s->restorable);
       uploadmap_destroy(&s->uploads);
+      free(s->vram_mirror);
       TextureRectSaveStateVec_move(&s->rects, &o->rects);
       s->restorable = o->restorable;
       RestorableRectSaveStateVec_init(&o->restorable);
       uploadmap_move(&s->uploads, &o->uploads);
+      s->vram_mirror = o->vram_mirror;
+      o->vram_mirror = NULL;
    }
    /* End of Save State
     * ======================================== */
@@ -2982,6 +2992,10 @@ static char retro_slash = '/';
 
    /* HD Texture Folder mode: 0 = content dir (default), 1 = system, 2 = save. */
    static int texture_dir_mode = 0;
+
+   /* Replace Textures on/off for this game session, kept across renderer
+    * rebuilds; reset when the game is unloaded. */
+   static struct tt_replace_latch tt_replace = { -1, -1 };
 
    /* Base directory for the texture dump/replacement folders, chosen by the HD
     * Texture Folder option. Falls back to the content directory if the selected
@@ -6102,6 +6116,7 @@ static bool is_power_of_two(int n) {
             size_t vram_count  = HdGpuCache_count(&self->hd_gpu_cache);
             int    fused_count = fused_page_vec_size(&self->fused_pages.pages);
             self->hd_textures_enabled = !self->hd_textures_enabled;
+            tt_replace_latch_toggle(&tt_replace, self->hd_textures_enabled);
             if (!self->hd_textures_enabled)
                texture_tracker_flush_hd_state(self); /* free HD VRAM immediately when turned off */
             TT_LOG_VERBOSE(RETRO_LOG_INFO, "Toggling hd textures: %s\n", self->hd_textures_enabled ? "on" : "off");
@@ -7030,6 +7045,13 @@ static int64_t page_bytes(FusionRects *fusion)
       }
       }
 
+      /* The VRAM mirror travels with the rects: see TextureTrackerSaveState. */
+      if (self->vram_mirror != NULL) {
+         state.vram_mirror = (uint16_t*)malloc((size_t)FB_WIDTH * FB_HEIGHT * sizeof(uint16_t));
+         if (state.vram_mirror != NULL)
+            memcpy(state.vram_mirror, self->vram_mirror, (size_t)FB_WIDTH * FB_HEIGHT * sizeof(uint16_t));
+      }
+
       tts_move(out, &state);
       tts_destroy(&state);
    }
@@ -7077,6 +7099,14 @@ static int64_t page_bytes(FusionRects *fusion)
             rrvec_push(&self->restorable_rects, &loaded);
             restorablerect_destroy(&loaded);
          }
+      }
+      /* Put the VRAM mirror back (the clearRegion above zeroed it):
+       * page-aligned replacements and CLUTs read outside a tracked upload
+       * hash from it. mirror_store also drops any memoised page hash. */
+      if (state->vram_mirror != NULL && self->vram_mirror != NULL) {
+         TTRect _full = { 0, 0, FB_WIDTH, FB_HEIGHT };
+         texture_tracker_mirror_store(self, _full, state->vram_mirror);
+         texture_tracker_clear_palette_cache(self, _full);
       }
       /* Need to reload the hd textures, too */
       {
@@ -7160,14 +7190,9 @@ void texture_tracker_free(TextureTracker *self)
 void texture_tracker_set_config(TextureTracker *self,
       const TextureTrackerConfig *cfg)
 {
-   /* Replace Textures is edge-applied: the in-game ']' toggle (see
-    * texture_tracker_endFrame) flips hd_textures_enabled directly, and this
-    * setter runs every frame from the option-refresh path - re-stamping the
-    * menu value unconditionally would immediately undo the hotkey. Only a
-    * CHANGED menu value re-applies (and re-syncs), matching the old inline
-    * apply logic in the Vulkan renderer. */
-   static int replace_textures_applied = -1; /* -1 = force the first apply */
-
+   /* Replace Textures follows the session latch: this setter runs every
+    * frame from the option-refresh path, and only a changed menu value
+    * overrides the in-game ']' toggle (texture_tracker_endFrame). */
    self->dump_enabled           = cfg->dump_enabled;
    /* Switching from a Lazy mode to Eager retires the journal (it is inert in
     * Eager): persist any training now, synchronously - this is option-apply
@@ -7182,12 +7207,20 @@ void texture_tracker_set_config(TextureTracker *self,
    self->replacement_fallback   = cfg->replacement_fallback;
    self->reduce_palette_range   = cfg->reduce_palette_range;
 
-   if ((int)cfg->hd_textures_enabled != replace_textures_applied) {
-      self->hd_textures_enabled = cfg->hd_textures_enabled;
-      if (!cfg->hd_textures_enabled)
-         texture_tracker_flush_hd_state(self); /* free HD VRAM immediately when turned off */
-      replace_textures_applied = cfg->hd_textures_enabled;
+   {
+      bool on = tt_replace_latch_menu(&tt_replace, cfg->hd_textures_enabled);
+      if (self->hd_textures_enabled != on) {
+         self->hd_textures_enabled = on;
+         if (!on)
+            texture_tracker_flush_hd_state(self); /* free HD VRAM immediately when turned off */
+      }
    }
+}
+
+void texture_tracker_session_reset(void)
+{
+   /* A new game starts from the menu value again. */
+   tt_replace_latch_reset(&tt_replace);
 }
 
 void texture_tracker_set_texture_dir_mode(int mode)

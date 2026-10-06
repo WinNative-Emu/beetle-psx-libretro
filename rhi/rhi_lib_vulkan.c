@@ -1592,7 +1592,7 @@ static bool context_is_valid(const struct Context *self) { return self->valid; }
     * rejected there is silently never applied to any pipeline -- while a
     * constant set past this bound is an out-of-bounds write into the
     * static state. Both happened; keep them in step. */
-   enum { VULKAN_NUM_SPEC_CONSTANTS = 10 };
+   enum { VULKAN_NUM_SPEC_CONSTANTS = 11 };
 
    struct ImplementationWorkarounds
    {
@@ -5835,7 +5835,9 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
        * programs, which also declare 0..6. */
       SpecConstIndex_PreciseColor = 8,
       /* Linear-light depth cueing; rides the precise-colour vertex path. */
-      SpecConstIndex_PgxpFog = 9
+      SpecConstIndex_PgxpFog = 9,
+      /* Actual primitive render-target format, independent of HDR options. */
+      SpecConstIndex_FramebufferFloat16 = 10
    };
 
    struct SaveState
@@ -6158,6 +6160,8 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
             (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? psx_pgxp_color : 0);
       commandbuffer_set_specialization_constant(cmd, SpecConstIndex_PgxpFog,
             (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_FramebufferFloat16,
+            self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT);
    }
 
    static void renderer_render_semi_transparent_opaque_texture_primitives(Renderer *self){
@@ -9126,6 +9130,7 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
    }
 
    { TTRect hd_texture_vram = make_rect(0, 0, 0, 0);
+   TTRect sampled_vram = make_rect(0, 0, 0, 0);
 
    if (self->render_state.texture_mode != TextureMode_None)
    {
@@ -9180,6 +9185,21 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
          hd_texture_vram.width = effective_rect.width >> shift;
          hd_texture_vram.height = effective_rect.height;
       }
+
+      /* Framebuffer queries take the exact sampled area, not the HD
+       * matching span whose right edge omits a column. */
+      sampled_vram = rhi_sampled_vram_rect(
+            self->render_state.texture_offset_x,
+            self->render_state.texture_offset_y,
+            self->render_state.UVLimits.min_u,
+            self->render_state.UVLimits.min_v,
+            self->render_state.UVLimits.max_u,
+            self->render_state.UVLimits.max_v,
+            self->render_state.texture_window.mask_x,
+            self->render_state.texture_window.mask_y,
+            self->render_state.texture_window.or_x,
+            self->render_state.texture_window.or_y,
+            shift);
    }
 
    /* Compute bounding box for the draw call. */
@@ -9229,10 +9249,7 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
    {
       if (rect_intersects(&self->render_state.draw_rect, &rect))
       {
-         /* HACK hd_texture_vram should contains the texture we are reading from
-          * in vram coordinate avoid texture filtering and enable scaled read if
-          * the texture is rendered content */
-         bool texture_rendered = fbatlas_texture_rendered(&self->atlas, &hd_texture_vram);
+         bool texture_rendered = fbatlas_texture_rendered(&self->atlas, &sampled_vram);
          filtering = !texture_rendered;
          scaled_read = texture_rendered;
       }
@@ -9247,7 +9264,6 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
       filtering = self->render_state.texture_mode != TextureMode_None;
       if (self->render_state.texture_mode != TextureMode_None)
       {
-         TTRect sampled_vram = hd_texture_vram;
          TTRect palette_rect = {
             self->render_state.palette_offset_x,
             self->render_state.palette_offset_y,
@@ -9260,8 +9276,6 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
           * themselves rendered. If only the live CLUT was rendered, however,
           * read the scaled domain so its colour is not quantized through a
           * scaled-to-native resolve before the palette lookup. */
-         if (sampled_vram.height && !sampled_vram.width)
-            sampled_vram.width = 1;
          texture_rendered = fbatlas_texture_rendered(&self->atlas, &sampled_vram);
          scaled_read = !texture_rendered &&
                fbatlas_texture_rendered(&self->atlas, &palette_rect);
@@ -9324,8 +9338,8 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
        hd_texture_vram.height > 0)
    {
       bool feedback = vram_prov_any(self,
-            (int)hd_texture_vram.x, (int)hd_texture_vram.y,
-            (int)hd_texture_vram.width + 1, (int)hd_texture_vram.height);
+            (int)sampled_vram.x, (int)sampled_vram.y,
+            (int)sampled_vram.width, (int)sampled_vram.height);
       if (!feedback && self->render_state.texture_mode != TextureMode_ABGR1555)
       {
          unsigned pal_w = self->render_state.texture_mode ==
@@ -10935,6 +10949,8 @@ static void renderer_semi_transparent_set_state(Renderer *self,
          (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? psx_pgxp_color : 0);
    commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
          (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
+   commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_FramebufferFloat16,
+         self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT);
    /* Only the feedback programs declare this; the pipeline hash masks it out
     * everywhere else. 1 = check-mask (historical behaviour), 0 = the routed
     * non-masked subtractive case. */
@@ -20225,6 +20241,10 @@ bool rhi_vulkan_open(bool is_pal)
 {
    libretro_log   = log_cb;
    content_is_pal = is_pal;
+
+   /* A new game starts from blank VRAM: drop what the previous context
+    * teardown kept for a renderer rebuild. */
+   savestate_destroy(&save_state);
 
    hw_render.context_type    = RETRO_HW_CONTEXT_VULKAN;
    hw_render.version_major   = VK_MAKE_VERSION(1, 0, 32);
