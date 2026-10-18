@@ -12,6 +12,8 @@
  *
  * Usage: glhost <core.so> <content> [savestate|-] [frames] [outdir]
  *   GLHOST_VARS: semicolon list of key=value core option overrides.
+ *   HOST_HDR_*: the display presented through GET_HDR_METADATA and
+ *   GET_DISPLAY_METADATA; see tools/hdr_display/host_metadata.h.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -24,6 +26,7 @@
 #include <EGL/eglext.h>
 #include <GL/gl.h>
 #include "libretro.h"
+#include "../hdr_display/host_metadata.h"
 
 /* ---- core option overrides / harvested defaults ---- */
 static char *var_keys[512]; static char *var_vals[512]; static int n_vars;
@@ -101,7 +104,11 @@ static bool env_cb(unsigned cmd, void *data)
          *(const char **)data = savedir; return true;
       case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
          soft_fmt = *(const unsigned *)data;
+         fprintf(stderr, "[glhost] pixel format %u\n", soft_fmt);
          return true;
+      case RETRO_ENVIRONMENT_GET_HDR_METADATA:
+      case RETRO_ENVIRONMENT_GET_DISPLAY_METADATA:
+         return host_hdr_metadata(cmd, data);
       case RETRO_ENVIRONMENT_GET_CAN_DUPE:
          *(bool *)data = true; return true;
       case RETRO_ENVIRONMENT_SET_VARIABLES:
@@ -314,6 +321,19 @@ static int fbo_init(void)
    return 1;
 }
 
+/* A core that negotiated RETRO_PIXEL_FORMAT_SCRGB_RGBA16F gets an RGBA16F
+ * "default framebuffer", as a frontend accepting the format must give it, and
+ * the dump also writes the float samples to <path>.raw (RGBA float32,
+ * bottom-up as GL reads them). */
+static int fbo_fp16;
+static void fbo_make_fp16(void)
+{
+   glBindTexture(GL_TEXTURE_2D, fbo_tex);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, fbo_w, fbo_h, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
+   fbo_fp16 = 1;
+   fprintf(stderr, "[glhost] framebuffer RGBA16F for scRGB\n");
+}
+
 static void dump_frame(const char *path)
 {
    unsigned w = last_w ? last_w : 640, h = last_h ? last_h : 480;
@@ -355,6 +375,20 @@ static void dump_frame(const char *path)
    bindfb_t pglBindFramebuffer = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
    if (!buf) return;
    pglBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   if (fbo_fp16)
+   {
+      float *fb = malloc((size_t)w * h * 4 * sizeof(float));
+      if (fb)
+      {
+         char  rawpath[1100];
+         FILE *rf;
+         glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, fb);
+         snprintf(rawpath, sizeof(rawpath), "%s.raw", path);
+         rf = fopen(rawpath, "wb");
+         if (rf) { fwrite(fb, sizeof(float), (size_t)w * h * 4, rf); fclose(rf); }
+         free(fb);
+      }
+   }
    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
    f = fopen(path, "wb");
    if (f)
@@ -493,6 +527,8 @@ int main(int argc, char **argv)
      if (!((load_t)dlsym(core, "retro_load_game"))(&info))
      { fprintf(stderr, "[glhost] retro_load_game failed\n"); return 4; }
    }
+   if (soft_fmt == RETRO_PIXEL_FORMAT_SCRGB_RGBA16F)
+      fbo_make_fp16();
 
    if (!hw_render.context_reset)
    {
