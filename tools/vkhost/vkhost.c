@@ -13,6 +13,13 @@
  *
  * Usage: vkhost <core.so> <content> [savestate] [frames] [outdir]
  *   VKHOST_VARS: semicolon list of key=value core option overrides.
+ *   VKHOST_PREEMPT=1: model RetroArch's Preemptive Frames (rollback by
+ *     one frame, glhost's GLHOST_PREEMPT=2): every frame restore the state
+ *     saved before the previous one, replay that frame, save, then run.
+ *   VKHOST_VARS_AT: semicolon list of frame:key=value option changes, each
+ *     applied before that frame's retro_run and reported through
+ *     GET_VARIABLE_UPDATE, as a frontend does when the user edits an option
+ *     (glhost's GLHOST_VARS_AT).
  *   VKHOST_NEGOTIATION=1: a frontend that predates Vulkan negotiation v2
  *   (no support query, only a version 1 interface accepted). By default
  *   the host offers v2, as RetroArch does, and requires the core to create
@@ -50,6 +57,34 @@ static void add_var(const char *k, const char *v)
 { if (n_vars < 512) { var_keys[n_vars] = strdup(k); var_vals[n_vars] = strdup(v); n_vars++; } }
 static const char *find_var(const char *k)
 { int i; for (i = 0; i < n_vars; i++) if (!strcmp(var_keys[i], k)) return var_vals[i]; return NULL; }
+static int vars_updated;
+static void set_var(const char *k, const char *v)
+{
+   int i;
+   for (i = 0; i < n_vars; i++)
+      if (!strcmp(var_keys[i], k))
+      { free(var_vals[i]); var_vals[i] = strdup(v); vars_updated = 1; return; }
+   add_var(k, v); vars_updated = 1;
+}
+/* Apply the VKHOST_VARS_AT entries scheduled for this frame. */
+static void apply_vars_at(int frame)
+{
+   const char *at = getenv("VKHOST_VARS_AT");
+   char *dup, *tok;
+   if (!at) return;
+   dup = strdup(at);
+   for (tok = strtok(dup, ";"); tok; tok = strtok(NULL, ";"))
+   {
+      char *colon = strchr(tok, ':'), *eq;
+      if (!colon || atoi(tok) != frame) continue;
+      eq = strchr(colon + 1, '=');
+      if (!eq) continue;
+      *eq = 0;
+      fprintf(stderr, "[vkhost] frame %d: %s=%s\n", frame, colon + 1, eq + 1);
+      set_var(colon + 1, eq + 1);
+   }
+   free(dup);
+}
 
 /* ---- state ---- */
 static void *core;
@@ -204,10 +239,62 @@ static VKAPI_ATTR VkResult VKAPI_CALL core_vkWaitForFences(VkDevice device,
    core_waits("vkWaitForFences");
    return real_wait_for_fences(device, count, fences, all, timeout);
 }
+/* Vulkan objects the core creates, counted so the steady-state report can
+ * say how many a run of frames needed: a display path that keeps its
+ * resources creates none once warmed up. */
+static unsigned long object_creates, object_creates_half;
+static PFN_vkCreateImage        real_create_image;
+static PFN_vkCreateImageView    real_create_image_view;
+static PFN_vkCreateBuffer       real_create_buffer;
+static PFN_vkCreateBufferView   real_create_buffer_view;
+static PFN_vkCreateFramebuffer  real_create_framebuffer;
+static PFN_vkAllocateMemory     real_allocate_memory;
+static VKAPI_ATTR VkResult VKAPI_CALL core_vkCreateImage(VkDevice d,
+      const VkImageCreateInfo *i, const VkAllocationCallbacks *a, VkImage *o)
+{ object_creates++; return real_create_image(d, i, a, o); }
+static VKAPI_ATTR VkResult VKAPI_CALL core_vkCreateImageView(VkDevice d,
+      const VkImageViewCreateInfo *i, const VkAllocationCallbacks *a, VkImageView *o)
+{ object_creates++; return real_create_image_view(d, i, a, o); }
+static VKAPI_ATTR VkResult VKAPI_CALL core_vkCreateBuffer(VkDevice d,
+      const VkBufferCreateInfo *i, const VkAllocationCallbacks *a, VkBuffer *o)
+{ object_creates++; return real_create_buffer(d, i, a, o); }
+static VKAPI_ATTR VkResult VKAPI_CALL core_vkCreateBufferView(VkDevice d,
+      const VkBufferViewCreateInfo *i, const VkAllocationCallbacks *a, VkBufferView *o)
+{ object_creates++; return real_create_buffer_view(d, i, a, o); }
+static VKAPI_ATTR VkResult VKAPI_CALL core_vkCreateFramebuffer(VkDevice d,
+      const VkFramebufferCreateInfo *i, const VkAllocationCallbacks *a, VkFramebuffer *o)
+{ object_creates++; return real_create_framebuffer(d, i, a, o); }
+static VKAPI_ATTR VkResult VKAPI_CALL core_vkAllocateMemory(VkDevice d,
+      const VkMemoryAllocateInfo *i, const VkAllocationCallbacks *a, VkDeviceMemory *o)
+{ object_creates++; return real_allocate_memory(d, i, a, o); }
+
+/* Compute workgroups the core dispatches. The renderer's CPU->VRAM uploads
+ * are compute passes sized by the rect, so this measures how much VRAM a
+ * run hands the GPU. */
+static unsigned long long dispatch_groups, dispatch_groups_half;
+static PFN_vkCmdDispatch        real_cmd_dispatch;
+static VKAPI_ATTR void VKAPI_CALL core_vkCmdDispatch(VkCommandBuffer cb,
+      uint32_t x, uint32_t y, uint32_t z)
+{ dispatch_groups += (unsigned long long)x * y * z; real_cmd_dispatch(cb, x, y, z); }
+
 static PFN_vkVoidFunction core_queue_entry(const char *name, PFN_vkVoidFunction real)
 {
    if (!real)
       return real;
+   if (!strcmp(name, "vkCmdDispatch"))
+   { real_cmd_dispatch = (PFN_vkCmdDispatch)real; return (PFN_vkVoidFunction)core_vkCmdDispatch; }
+   if (!strcmp(name, "vkCreateImage"))
+   { real_create_image = (PFN_vkCreateImage)real; return (PFN_vkVoidFunction)core_vkCreateImage; }
+   if (!strcmp(name, "vkCreateImageView"))
+   { real_create_image_view = (PFN_vkCreateImageView)real; return (PFN_vkVoidFunction)core_vkCreateImageView; }
+   if (!strcmp(name, "vkCreateBuffer"))
+   { real_create_buffer = (PFN_vkCreateBuffer)real; return (PFN_vkVoidFunction)core_vkCreateBuffer; }
+   if (!strcmp(name, "vkCreateBufferView"))
+   { real_create_buffer_view = (PFN_vkCreateBufferView)real; return (PFN_vkVoidFunction)core_vkCreateBufferView; }
+   if (!strcmp(name, "vkCreateFramebuffer"))
+   { real_create_framebuffer = (PFN_vkCreateFramebuffer)real; return (PFN_vkVoidFunction)core_vkCreateFramebuffer; }
+   if (!strcmp(name, "vkAllocateMemory"))
+   { real_allocate_memory = (PFN_vkAllocateMemory)real; return (PFN_vkVoidFunction)core_vkAllocateMemory; }
    if (!strcmp(name, "vkQueueSubmit"))
    { real_queue_submit = (PFN_vkQueueSubmit)real; return (PFN_vkVoidFunction)core_vkQueueSubmit; }
    if (!strcmp(name, "vkQueueWaitIdle"))
@@ -340,7 +427,7 @@ static bool env_cb(unsigned cmd, void *data)
          return v != NULL;
       }
       case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
-         *(bool *)data = false; return true;
+         *(bool *)data = vars_updated != 0; vars_updated = 0; return true;
       case RETRO_ENVIRONMENT_SET_HW_RENDER:
       {
          struct retro_hw_render_callback *cb = (struct retro_hw_render_callback *)data;
@@ -620,7 +707,8 @@ static int dump_frame(const char *path)
                  float v = 0.0f;
                  if (e) v = (float)(m + 1024) * (1.0f / 1024.0f) * (float)(1 << e) / 32768.0f;
                  else   v = (float)m * (1.0f / 1024.0f) / 16384.0f;
-                 if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+                 if (v < 0.0f) v = 0.0f;
+                 if (v > 1.0f) v = 1.0f;
                  px[c] = (unsigned char)(v * 255.0f + 0.5f);
               }
            }
@@ -658,7 +746,8 @@ int main(int argc, char **argv)
    if (argc > 4) frames = atoi(argv[4]);
    if (argc > 5) outdir = argv[5];
    snprintf(cmdbuf, sizeof(cmdbuf), "mkdir -p %s %s %s", outdir, sysdir, savedir);
-   system(cmdbuf);
+   if (system(cmdbuf) != 0)
+      fprintf(stderr, "[vkhost] could not create %s\n", outdir);
 
    /* defaults, overridable via VKHOST_VARS */
    /* Must be a value the option declares; an undeclared value leaves
@@ -786,7 +875,10 @@ run_frames_sw:
       bool (*retro_unserialize_fn)(const void *, size_t) = dlsym(core, "retro_unserialize");
       if (!f) { fprintf(stderr, "[vkhost] cannot open state\n"); return 4; }
       fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-      data = malloc(sz); fread(data, 1, sz, f); fclose(f);
+      data = malloc(sz);
+      if (!data || fread(data, 1, sz, f) != (size_t)sz)
+      { fprintf(stderr, "[vkhost] cannot read state\n"); fclose(f); return 4; }
+      fclose(f);
       /* RetroArch RASTATE container: find the MEM chunk and use its payload. */
       if (sz > 8 && !memcmp(data, "RASTATE", 7))
       {
@@ -833,9 +925,56 @@ run_frames_sw:
             bench_skip = frames / 4;
       }
 
+      typedef bool   (*vk_ser_t)(void *, size_t);
+      typedef bool   (*vk_unser_t)(const void *, size_t);
+      typedef size_t (*vk_ssize_t)(void);
+      vk_ser_t   ser   = (vk_ser_t)dlsym(core, "retro_serialize");
+      vk_unser_t unser = (vk_unser_t)dlsym(core, "retro_unserialize");
+      vk_ssize_t ssz   = (vk_ssize_t)dlsym(core, "retro_serialize_size");
+      int        preempt = getenv("VKHOST_PREEMPT") != NULL;
+      /* VKHOST_RELOAD: save a state and load it straight back before
+       * every frame. Nothing changes in between, so the output must be
+       * exactly what a run without it produces. */
+      int        reload  = getenv("VKHOST_RELOAD") != NULL;
+      void      *pbuf = NULL, *pbuf2 = NULL;
+      size_t     pcap = 0;
+      int        have_prev = 0;
       for (i = 0; i < frames; i++)
       {
          cur_frame = i;
+         if (preempt && ser && unser && ssz)
+         {
+            size_t need = ssz();
+            if (need > pcap)
+            {
+               free(pbuf); free(pbuf2);
+               pbuf = malloc(need); pbuf2 = malloc(need); pcap = need;
+            }
+            if (pbuf && pbuf2)
+            {
+               if (have_prev)
+               {
+                  if (!unser(pbuf, pcap))
+                     fprintf(stderr, "[vkhost] rollback unser FAILED frame %d\n", i);
+                  retro_run_fn();   /* replay the previous frame */
+               }
+               if (!ser(pbuf2, need))
+                  fprintf(stderr, "[vkhost] rollback ser FAILED frame %d\n", i);
+               { void *t = pbuf; pbuf = pbuf2; pbuf2 = t; }
+               have_prev = 1;
+            }
+         }
+         if (reload && ser && unser && ssz)
+         {
+            size_t need = ssz();
+            if (need > pcap)
+            {
+               free(pbuf); free(pbuf2);
+               pbuf = malloc(need); pbuf2 = malloc(need); pcap = need;
+            }
+            if (!pbuf || !ser(pbuf, need) || !unser(pbuf, need))
+               fprintf(stderr, "[vkhost] reload FAILED frame %d\n", i);
+         }
          if (bench && i == bench_skip)
          {
             if (vkctx.device)
@@ -845,6 +984,12 @@ run_frames_sw:
                host_unlock_queue();
             }
             clock_gettime(CLOCK_MONOTONIC, &t0);
+         }
+         apply_vars_at(i);
+         if (i == frames / 2)
+         {
+            object_creates_half  = object_creates;
+            dispatch_groups_half = dispatch_groups;
          }
          retro_run_fn();
          {
@@ -915,6 +1060,10 @@ run_frames_sw:
       __atomic_store_n(&queue_thread_run, 0, __ATOMIC_SEQ_CST);
       pthread_join(queue_thread, NULL);
    }
+   fprintf(stderr, "[vkhost] steady state: %lu Vulkan objects created in the second half of the run\n",
+         object_creates - object_creates_half);
+   fprintf(stderr, "[vkhost] steady state: %llu compute workgroups dispatched in the second half of the run\n",
+         dispatch_groups - dispatch_groups_half);
    fprintf(stderr, "[vkhost] done: %d frames run, %u valid, %d validation errors, %d warnings,"
            " %d unlocked uses of the frontend's queue, %d waits with its lock held\n",
            frames, frame_valid, validation_errors, validation_warnings,
