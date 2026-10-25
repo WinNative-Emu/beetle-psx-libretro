@@ -93,6 +93,7 @@ uint8_t widescreen_hack_aspect_ratio_setting;
 uint8_t psx_gpu_upscale_shift;
 uint8_t psx_gpu_upscale_shift_hw;
 bool psx_gpu_rasterize_both_fields = false;
+bool psx_gpu_bob_scanout = false;
 int line_render_mode;
 int filter_mode;
 int crop_overscan = 0;
@@ -104,6 +105,7 @@ uint8_t startup_frame_count = 0;
 
 int aspect_ratio_setting = 0;
 bool aspect_ratio_dirty = false;
+bool crop_window_dirty = false;
 bool gpu_fbwrite_fifo_delay = false;
 
 /* libretro callback pointers, formerly defined in libretro_cbs.c. Declared in
@@ -428,46 +430,39 @@ static Deinterlacer deint;
 static MDFN_Surface *surf = NULL;
 
 /* Left edge of the picture in a line of *width dots, and *width cut
- * down to the picture, when overscan is cropped. */
+ * down to the picture, when overscan is cropped.  The line starts at GPU
+ * clock 488 and spans 2800 clocks; what is kept is the window the GPU
+ * latched for the frame (rhi_common_crop_window). */
 static unsigned crop_line(unsigned *width)
 {
+   uint32_t win;
+   unsigned clock_div, start, w;
+
    if (!crop_overscan)
       return 0;
 
-   /* Crop total # of pixels output by PSX in active scanline region down to # of pixels in corresponding horizontal display mode
-    * 280 width -> 256 width.
-    * 350 width -> 320 width.
-    * 400 width -> 366 width.
-    * 560 width -> 512 width.
-    * 700 width -> 640 width. */
    switch (*width)
    {
-      case 280:
-         *width = 256 - image_crop;
-         return 12 - image_offset + (image_crop / 2);
-
-      case 350:
-         *width = 320 - image_crop;
-         return 15 - image_offset + (image_crop / 2);
-
-      /* 368px mode. Some games are overcropped at 364 width or undercropped at 368 width, so crop to 366.
-         Adjust in future if there are issues. */
-      case 400:
-         *width = 366 - image_crop;
-         return 17 - image_offset + (image_crop / 2);
-
-      case 560:
-         *width = 512 - image_crop;
-         return 24 - image_offset + (image_crop / 2);
-
-      case 700:
-         *width = 640 - image_crop;
-         return 30 - image_offset + (image_crop / 2);
-
+      case 280: clock_div = 10; break;
+      case 350: clock_div = 8;  break;
+      case 400: clock_div = 7;  break;
+      case 560: clock_div = 5;  break;
+      case 700: clock_div = 4;  break;
       default:
          /* This shouldn't happen. */
          return 0;
    }
+
+   win   = GPU_get_crop_window();
+   /* Same truncation as the scanout's own dx_start */
+   start = (unsigned)RHI_CROP_WIN_START(win) / clock_div - 488 / clock_div;
+   /* Rounded to the dot: the standard 2560 clocks keep 366 in 368 mode */
+   w     = ((unsigned)RHI_CROP_WIN_WIDTH(win) + clock_div / 2) / clock_div;
+   if (w > *width - start)
+      w = *width - start;
+
+   *width = w - image_crop;
+   return start - image_offset + (image_crop / 2);
 }
 
 /* RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER for the software
@@ -537,6 +532,82 @@ static void acquire_lent_surface(EmulateSpecStruct *spec)
    spec->loan     = &lent_surf;
    spec->loan_h   = lend_h;
    spec->loan_dmw = lend_dmw;
+   spec->loan_win = GPU_get_crop_window();
+}
+
+/* The new Video CD picture, converted straight into a framebuffer of the
+ * frontend's; NULL when the frontend has none to lend. */
+static const void *lend_vcd_picture(unsigned w, unsigned h, size_t *pitch)
+{
+   struct retro_framebuffer fb;
+
+   if (!environ_cb)
+      return NULL;
+
+   memset(&fb, 0, sizeof(fb));
+   fb.width        = w;
+   fb.height       = h;
+   fb.access_flags = RETRO_MEMORY_ACCESS_WRITE;
+
+   if (   !environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
+       || !fb.data
+       || fb.format != RETRO_PIXEL_FORMAT_XRGB8888
+       || fb.pitch  <  (size_t)w * sizeof(uint32_t)
+       || fb.pitch  %  sizeof(uint32_t))
+      return NULL;
+
+   VCD_ConvertVideo(fb.data, fb.pitch);
+   *pitch = fb.pitch;
+   return fb.data;
+}
+
+/* The 480i picture the deferred scanout (the "Off" deinterlacer) holds,
+ * scanned out straight into a frontend buffer cut to x0, w, h (upscaled)
+ * when it is the whole picture and the frontend lends one: its pixels,
+ * and *pitch. Otherwise it goes to the core's surface, and NULL. */
+static MDFN_Surface field_surf;
+
+static const uint32_t *flush_deferred_scanout(unsigned x0, unsigned w,
+      unsigned h, unsigned *pitch)
+{
+   struct retro_framebuffer fb;
+   const unsigned us = GPU_get_upscale_shift();
+   int32_t        dmw;
+
+   if (   !environ_cb
+       || FrontIO_ReadsScanout(PSX_FIO)
+       || (VCD_GetMode() != VCD_MODE_OFF && VCD_GetAVSwitch())
+       || !GPU_DeferredScanoutWhole((int32_t)(h >> us), &dmw)
+       || x0 + w > ((unsigned)dmw << us))
+   {
+      GPU_FlushDeferredScanout(NULL);
+      return NULL;
+   }
+
+   memset(&fb, 0, sizeof(fb));
+   fb.width        = w;
+   fb.height       = h;
+   fb.access_flags = RETRO_MEMORY_ACCESS_WRITE;
+
+   if (   !environ_cb(RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER, &fb)
+       || !fb.data
+       || fb.format != RETRO_PIXEL_FORMAT_XRGB8888
+       || fb.pitch  <  (size_t)w * sizeof(uint32_t)
+       || fb.pitch  %  sizeof(uint32_t))
+   {
+      GPU_FlushDeferredScanout(NULL);
+      return NULL;
+   }
+
+   field_surf.pixels     = (uint32_t *)fb.data;
+   field_surf.w          = (int32_t)w;
+   field_surf.h          = (int32_t)h;
+   field_surf.pitchinpix = (int32_t)(fb.pitch / sizeof(uint32_t));
+   field_surf.x0         = (int32_t)x0;
+   GPU_FlushDeferredScanout(&field_surf);
+
+   *pitch = (unsigned)fb.pitch;
+   return field_surf.pixels;
 }
 
 enum
@@ -5838,6 +5909,7 @@ static void check_variables(bool startup)
          Deinterlacer_SetType(&deint, DEINT_WEAVE);
 
       psx_gpu_rasterize_both_fields = (Deinterlacer_GetType(&deint) == DEINT_OFF);
+      psx_gpu_bob_scanout           = (Deinterlacer_GetType(&deint) == DEINT_BOB);
    }
 
    apply_compatibility_settings();
@@ -6996,12 +7068,10 @@ void retro_run(void)
 
    ForceEventUpdates(timestamp);
 
-   /* Drain any deferred SW-renderer scanout records collected
-    * during this frame's emulation.  See GPU_FlushDeferredScanout
-    * and psx_gpu_rasterize_both_fields - this is the safe point
-    * to read VRAM since rasterisation for this frame is finished
-    * and the frontend hasn't yet read the surface for display. */
-   GPU_FlushDeferredScanout();
+   /* The deferred SW-renderer scanout records collected during this
+    * frame's emulation (psx_gpu_rasterize_both_fields) are drained in
+    * retro_run below, once the picture's size is known: rasterisation
+    * for this frame is finished, and nothing touches VRAM before. */
 
    espec->SoundBufSize = IntermediateBufferPos;
    IntermediateBufferPos = 0;
@@ -7067,6 +7137,14 @@ void retro_run(void)
          aspect_ratio_dirty = false;
 
       // If unable to change geometry here, defer to next frame and leave aspect_ratio_dirty flagged
+   }
+
+   /* The cropped picture's aspect follows the crop window, which follows
+    * the game's horizontal display range. */
+   if (MDFN_UNLIKELY(crop_window_dirty))
+   {
+      if (!crop_overscan || retro_set_geometry())
+         crop_window_dirty = false;
    }
 
    // Check if timing needs to be changed due to interlacing change on this frame
@@ -7171,7 +7249,13 @@ void retro_run(void)
       width  <<= upscale_shift;
       height <<= upscale_shift;
 
-      if (frame_surf != &lent_surf)
+      pix = flush_deferred_scanout(pix_offset << upscale_shift,
+            width, height, &pitch);
+      if (pix)
+      {
+         /* the 480i "Off" picture, straight in a frontend buffer */
+      }
+      else if (frame_surf != &lent_surf)
          pix = frame_surf->pixels + (pix_offset << upscale_shift);
       /* Handed back only exactly as lent; anything else is a dupe. */
       else if (   (int32_t)(pix_offset << upscale_shift) == lent_surf.x0
@@ -7209,10 +7293,20 @@ void retro_run(void)
    {
       unsigned    vcd_w = 0, vcd_h = 0;
       size_t      vcd_pitch = 0;
-      const void *vcd_fb;
+      const void *vcd_fb    = NULL;
+      bool        fresh;
 
       VCD_RunFrame();
-      vcd_fb = VCD_GetVideo(&vcd_w, &vcd_h, &vcd_pitch);
+      fresh = VCD_PendingVideo(&vcd_w, &vcd_h);
+
+      /* A Video CD runs at half the display rate or less. Where the
+       * frontend dupes, a new picture is converted straight into its own
+       * framebuffer and the frames between are dupes; otherwise each is
+       * shown from the core's copy. */
+      if (fresh && allow_frame_duping && rhi_intf_is_type() == RHI_SOFTWARE)
+         vcd_fb = lend_vcd_picture(vcd_w, vcd_h, &vcd_pitch);
+      if (!vcd_fb && (fresh || !allow_frame_duping))
+         vcd_fb = VCD_GetVideo(&vcd_w, &vcd_h, &vcd_pitch);
 
       if (vcd_fb)
          rhi_intf_finalize_frame(vcd_fb, vcd_w, vcd_h, (unsigned)vcd_pitch);
@@ -7220,13 +7314,18 @@ void retro_run(void)
          rhi_intf_finalize_frame(NULL, width, height,
                MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
 
+      /* Handed over where it lies in the ring, in two spans at its wrap */
       if (audio_batch_cb)
       {
-         static int16_t vcd_abuf[4096 * 2];
-         size_t frames = VCD_GetAudio(vcd_abuf,
-               sizeof(vcd_abuf) / (2 * sizeof(int16_t)));
-         if (frames)
-            audio_batch_cb(vcd_abuf, frames);
+         unsigned       spans;
+         size_t         frames;
+         const int16_t *pcm;
+
+         for (spans = 0; spans < 2 && (pcm = VCD_PeekAudio(&frames)); spans++)
+         {
+            audio_batch_cb(pcm, frames);
+            VCD_ConsumeAudio(frames);
+         }
       }
    }
    else
@@ -7457,11 +7556,11 @@ size_t retro_serialize_size(void)
       st.malloced       = 0;
       st.initial_malloc = 0;
       st.fixed          = false;
+      st.sizing         = true;
 
       if (!MDFNSS_SaveSM(&st, 0, 0, NULL, NULL, NULL))
          return 0;
 
-      free(st.data);
       return st.len;
    }
 
@@ -7498,6 +7597,7 @@ bool retro_serialize(void *data, size_t size)
    st.malloced       = size > UINT32_MAX ? UINT32_MAX : (uint32_t)size;
    st.initial_malloc = 0;
    st.fixed          = true;
+   st.sizing         = false;
 
    FastSaveStates = UsingFastSavestates();
    ret            = MDFNSS_SaveSM(&st, 0, 0, NULL, NULL, NULL);
@@ -7532,6 +7632,7 @@ bool retro_unserialize(const void *data, size_t size)
    st.malloced       = 0;
    st.initial_malloc = 0;
    st.fixed          = true;
+   st.sizing         = false;
 
    FastSaveStates = UsingFastSavestates();
    okay           = MDFNSS_LoadSM(&st, 0, 0);
