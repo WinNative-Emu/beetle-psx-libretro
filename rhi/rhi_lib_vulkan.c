@@ -19,6 +19,7 @@
 #include <retro_inline.h>
 #include <math.h>
 #include "rhi_tt.h"
+#include "rhi_upscaler.h"
 
 /* Force-inline shim for converted accessors. Must resolve to a real
  * always-inline so that the small accessor free functions retain identical
@@ -1727,6 +1728,10 @@ static size_t tfl_get_layer_size(const struct TextureFormatLayout *self,
    {
       return self->mips[mip].block_image_height * tfl_get_row_size(self, mip);
    }
+static void tfl_set_2d(struct TextureFormatLayout *self, VkFormat format,
+      uint32_t width, uint32_t height, uint32_t array_layers, uint32_t mip_levels);
+static void tfl_build_buffer_image_copies(const struct TextureFormatLayout *self,
+      VkBufferImageCopy *copies, unsigned *num_copies);
 static const TextureFormatLayoutMipInfo *tfl_get_mip_info(const struct TextureFormatLayout *self,
       uint32_t mip)
    {
@@ -4735,6 +4740,11 @@ static void cbh_move(struct CommandBufferHandle *dst,
    {
       SemaphoreHandleVec wait_semaphores;
       VkPipelineStageVec wait_stages;
+      /* The fence of the latest submit on the queue, when that submit was
+       * not asked for one: it signals once everything submitted to the
+       * queue so far has completed, so it can serve as the frame's fence
+       * without a submit of its own. */
+      VkFence tail_fence;
       bool need_fence;
    };
    typedef struct QueueData QueueData;
@@ -6014,6 +6024,7 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
    uint32_t vram_gpu_written[VRAM_PROV_WORDS];
          bool texture_tracking_enabled;
          TextureTracker *tracker;
+         bool hd_staging_uncached; /* no cached host memory for HD upload memory */
 
          CommandBufferHandle cmd;
 
@@ -6028,6 +6039,7 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
             Program *readback_pack;
             Program *unscaled_quad_blitter;
             Program *scaled_quad_blitter;
+            Program *upscaler_motion;
             Program *bpp24_quad_blitter;
             Program *bpp24_yuv_quad_blitter;
             /* HDR10 (PQ Rec.2020) counterparts of the display quad blitters,
@@ -6130,6 +6142,11 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
             uint32_t dt_serial;
          } output_key;
          ImageHandle reuseable_scanout;
+         /* The frontend's temporal upscaler (rhi_upscaler.h): what keeps
+          * the frame's primitives, and the jitter they are drawn with, in
+          * native pixels */
+         psx_upscaler_t *upscaler;
+         float upscaler_jitter_x, upscaler_jitter_y;
          /* Analog path intermediates. sig holds the modulated signal at the
           * CRTC base clock, sep the separated luma/chroma; both are RG16F and
           * bipolar (composite swings negative and the comb produces negative
@@ -6554,6 +6571,12 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
    static const uint32_t quad_vert[] =
 #include "shaders_vulkan/prebuilt/quad.vert.inc"
       ;
+   static const uint32_t upscaler_motion_vert[] =
+#include "shaders_vulkan/prebuilt/upscaler_motion.vert.inc"
+      ;
+   static const uint32_t upscaler_motion_frag[] =
+#include "shaders_vulkan/prebuilt/upscaler_motion.frag.inc"
+      ;
    static const uint32_t scaled_quad_frag[] =
 #include "shaders_vulkan/prebuilt/scaled.quad.frag.inc"
       ;
@@ -6892,6 +6915,7 @@ static void renderer_init(Renderer *self,
    self->primitive_index = 0;
    self->render_pass_is_feedback = false;
    self->quad.data = NULL;
+   self->upscaler = psx_upscaler_new();
 
    /* ImageHandle is now a plain struct with no default member initializer;
     * null every handle member so conditional assignment and ~Renderer's
@@ -6916,6 +6940,7 @@ static void renderer_init(Renderer *self,
    self->reuseable_scanout.data       = NULL;
    fbatlas_init(&self->atlas);
    self->tracker = NULL; /* created below via texture_tracker_new once the GPU backend is up */
+   self->hd_staging_uncached = false;
    /* Sanity check settings, 16x IR with 16x MSAA will exhaust most GPUs VRAM alone. */
    if (self->scaling == 16 && self->msaa > 1)
    {
@@ -7267,6 +7292,9 @@ static void renderer_init_pipelines(Renderer *self)
 
    self->pipelines.scaled_quad_blitter =
       device_request_program_graphics_code(self->device, quad_vert, sizeof(quad_vert), scaled_quad_frag, sizeof(scaled_quad_frag));
+   self->pipelines.upscaler_motion =
+      device_request_program_graphics_code(self->device, upscaler_motion_vert, sizeof(upscaler_motion_vert),
+                                           upscaler_motion_frag, sizeof(upscaler_motion_frag));
    self->pipelines.bpp24_quad_blitter =
       device_request_program_graphics_code(self->device, quad_vert, sizeof(quad_vert), bpp24_quad_frag, sizeof(bpp24_quad_frag));
    self->pipelines.bpp24_yuv_quad_blitter =
@@ -7393,6 +7421,9 @@ static void renderer_set_draw_rect(Renderer *self, const TTRect *rect)
 {
    fbatlas_set_draw_rect(&self->atlas, rect);
    self->render_state.draw_rect = *rect;
+   if (rect->width && rect->height)
+      psx_upscaler_set_draw_area(self->upscaler, rect->x, rect->y,
+            rect->x + rect->width - 1, rect->y + rect->height - 1);
 
    { const VkRect2D *last = Rect2DVec_back(&self->queue.scissors);
    const int scaled_x = (int)(rect->x * self->scaling);
@@ -9865,8 +9896,8 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
    unsigned min_u = FB_WIDTH;
    unsigned min_v = FB_HEIGHT;
    { unsigned i; for (i = 0; i < count; i++) {
-      float tmp_x = vertices[i].x + self->render_state.draw_offset_x;
-      float tmp_y = vertices[i].y + self->render_state.draw_offset_y;
+      float tmp_x = vertices[i].x + self->render_state.draw_offset_x + self->upscaler_jitter_x;
+      float tmp_y = vertices[i].y + self->render_state.draw_offset_y + self->upscaler_jitter_y;
       max_x = max_(max_x, tmp_x);
       max_y = max_(max_y, tmp_y);
       min_x = min_(min_x, tmp_x);
@@ -10394,6 +10425,164 @@ static void renderer_build_native_interpolants(Renderer *self,
    }
 }
 
+/* Keeps a polygon or sprite for the temporal upscaler, with what tells
+ * it from others: its texture, palette, blending, texture coordinates
+ * and, flat, its colour (a Gouraud polygon's colours change with its
+ * lighting); and its family, the same less the texture coordinates and
+ * colour, for when those are what changed */
+static void renderer_upscaler_keep(Renderer *self, const Vertex *vertices, unsigned count)
+{
+   psx_upscaler_point_t points[4];
+   uint64_t signature;
+   uint64_t family;
+   unsigned flags = 0;
+   unsigned i;
+   bool flat = true;
+
+   if (!psx_upscaler_is_active(self->upscaler))
+      return;
+   for (i = 0; i < count; i++)
+   {
+      points[i].x = vertices[i].x + self->render_state.draw_offset_x;
+      points[i].y = vertices[i].y + self->render_state.draw_offset_y;
+      points[i].w = vertices[i].w;
+      if (vertices[i].color != vertices[0].color)
+         flat = false;
+   }
+   if (self->render_state.semi_transparent != SemiTransparentMode_None)
+      flags |= PSX_UPSCALER_TRANSLUCENT;
+   if (self->render_state.primitive_type == PrimitiveType_Sprite)
+      flags |= PSX_UPSCALER_SPRITE;
+
+   signature = psx_upscaler_hash(psx_upscaler_hash_init(), count | (flags << 8)
+         | ((uint32_t)self->render_state.texture_mode << 16)
+         | ((uint32_t)self->render_state.semi_transparent << 20)
+         | ((uint32_t)self->render_state.mask_test << 24)
+         | ((uint32_t)self->render_state.force_mask_bit << 25)
+         | ((uint32_t)self->render_state.texture_color_modulate << 26));
+   if (self->render_state.texture_mode != TextureMode_None)
+   {
+      signature = psx_upscaler_hash(signature, self->render_state.texture_offset_x | (self->render_state.texture_offset_y << 16));
+      signature = psx_upscaler_hash(signature, self->render_state.palette_offset_x | (self->render_state.palette_offset_y << 16));
+   }
+   family = signature;
+   if (self->render_state.texture_mode != TextureMode_None)
+      for (i = 0; i < count; i++)
+         signature = psx_upscaler_hash(signature, vertices[i].u | ((uint32_t)vertices[i].v << 16));
+   if (flat)
+      signature = psx_upscaler_hash(signature, vertices[0].color);
+   psx_upscaler_primitive(self->upscaler, points, count, flags, signature, family);
+   /* drawn with its record's jitter: a game drawing the other buffer
+    * mid-frame has it from here on */
+   { float jx, jy;
+   psx_upscaler_jitter(self->upscaler, &jx, &jy);
+   self->upscaler_jitter_x = jx / (float)self->scaling;
+   self->upscaler_jitter_y = jy / (float)self->scaling; }
+}
+
+/* Draws the temporal upscaler's pass for the frame shown: its motion
+ * vectors, depth and transparency mask, @width x @height render pixels,
+ * into @mv, @depth and @mask */
+static void renderer_upscaler_pass(Renderer *self, const psx_upscaler_geometry_t *g,
+      unsigned width, unsigned height, Image *mv, Image *depth, Image *mask)
+{
+   RenderPassInfo rp;
+   psx_upscaler_vertex_t *dst;
+   struct Push
+   {
+      float inv_resolution[2];
+      float translucent;
+      float pad;
+      /* primitive.vert's half pixel at 1x: the PSX rasterizes a pixel
+       * as its top left corner */
+      float offset[2];
+   } push;
+   unsigned i;
+
+   renderer_ensure_command_buffer(self);
+   render_pass_info_defaults(&rp);
+   rp.color_attachments[0] = image_get_view(mv);
+   rp.color_attachments[1] = image_get_view(depth);
+   rp.color_attachments[2] = image_get_view(mask);
+   rp.num_color_attachments = 3;
+   rp.store_attachments = 7;
+   rp.clear_attachments = 7;
+   memset(rp.clear_color, 0, sizeof(rp.clear_color));
+   rp.clear_color[1].float32[0] = 1.0f;
+   rp.clear_depth_stencil.depth = 1.0f;
+   rp.clear_depth_stencil.stencil = 0;
+   rp.depth_stencil = device_get_transient_attachment(self->device, width, height,
+         device_get_default_depth_format(self->device), 0, 1, 1);
+   rp.op_flags = RENDER_PASS_OP_CLEAR_DEPTH_STENCIL_BIT;
+
+   /* A reused image may still have reads of an earlier frame ahead of
+    * this pass in the queue: wait for all of them before overwriting. */
+   commandbuffer_image_barrier(cbh_get(&self->cmd), mv, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+   commandbuffer_image_barrier(cbh_get(&self->cmd), depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+   commandbuffer_image_barrier(cbh_get(&self->cmd), mask, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+   commandbuffer_begin_render_pass(cbh_get(&self->cmd), &rp, VK_SUBPASS_CONTENTS_INLINE);
+   if (g->num_vertices)
+   {
+      dst = (psx_upscaler_vertex_t *)commandbuffer_allocate_vertex_data(cbh_get(&self->cmd), 0,
+            (VkDeviceSize)g->num_vertices * sizeof(*dst), sizeof(*dst), VK_VERTEX_INPUT_RATE_VERTEX);
+      if (dst)
+      {
+         VkViewport vp;
+         VkRect2D sc;
+         memcpy(dst, g->vertices, (size_t)g->num_vertices * sizeof(*dst));
+         commandbuffer_set_opaque_state(cbh_get(&self->cmd));
+         commandbuffer_set_program(cbh_get(&self->cmd), self->pipelines.upscaler_motion);
+         commandbuffer_set_specialization_constant_mask(cbh_get(&self->cmd), 0);
+         commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(psx_upscaler_vertex_t, x));
+         commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(psx_upscaler_vertex_t, motion_x));
+         commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+         commandbuffer_set_cull_mode(cbh_get(&self->cmd), VK_CULL_MODE_NONE);
+         commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS_OR_EQUAL);
+         vp.x = 0.0f; vp.y = 0.0f; vp.width = (float)width; vp.height = (float)height;
+         vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+         commandbuffer_set_viewport(cbh_get(&self->cmd), &vp);
+         sc.offset.x = 0; sc.offset.y = 0; sc.extent.width = width; sc.extent.height = height;
+         commandbuffer_set_scissor(cbh_get(&self->cmd), &sc);
+         push.inv_resolution[0] = 1.0f / (float)width;
+         push.inv_resolution[1] = 1.0f / (float)height;
+         push.pad               = 0.0f;
+         push.offset[0]         = self->scaling == 1 ? 0.5f : 0.0f;
+         push.offset[1]         = push.offset[0];
+         for (i = 0; i < g->num_draws; i++)
+         {
+            const psx_upscaler_draw_t *d = &g->draws[i];
+            bool translucent = (d->flags & PSX_UPSCALER_TRANSLUCENT) != 0;
+            /* what is blended over writes no depth: the upscaler takes
+             * this frame's colour there over its history */
+            commandbuffer_set_depth_test(cbh_get(&self->cmd), true, !translucent);
+            push.translucent = translucent ? 1.0f : 0.0f;
+            commandbuffer_push_constants(cbh_get(&self->cmd), &push, 0, sizeof(push));
+            commandbuffer_draw(cbh_get(&self->cmd), d->count, 1, d->first, 0);
+         }
+      }
+   }
+   commandbuffer_end_render_pass(cbh_get(&self->cmd));
+   commandbuffer_image_barrier(cbh_get(&self->cmd), mv, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_ACCESS_SHADER_READ_BIT);
+   commandbuffer_image_barrier(cbh_get(&self->cmd), depth, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_ACCESS_SHADER_READ_BIT);
+   commandbuffer_image_barrier(cbh_get(&self->cmd), mask, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_ACCESS_SHADER_READ_BIT);
+}
+
 static void renderer_draw_triangle(Renderer *self, const Vertex *vertices)
 {
    HdTextureHandle hd_texture_index;
@@ -10402,6 +10591,7 @@ static void renderer_draw_triangle(Renderer *self, const Vertex *vertices)
       return;
 
    ih_reset(&self->last_scanout);
+   renderer_upscaler_keep(self, vertices, 3);
 
    hd_texture_index = hd_handle_make_none();
    { bool filtering = false;
@@ -10455,6 +10645,8 @@ static void renderer_draw_quad(Renderer *self, const Vertex *vertices, bool poly
       return;
 
    ih_reset(&self->last_scanout);
+   if (!line_vertices)
+      renderer_upscaler_keep(self, vertices, 4);
 
    /* build_attribs may flush the queues, thus calling reset_queue and
     * invalidating any pre-existing HdTextureHandle. self->tracker.no_hd_texture
@@ -11437,6 +11629,24 @@ static ImageHandle renderer_upload_texture(Renderer *self,
    info.misc = 0u;
    info.initial_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+   if (levels->staging) {
+      /* Decoded straight into upload memory (vk_tt_staging_alloc): record
+       * the copy from it, nothing to copy here. Flushes it first when the
+       * memory is not coherent. */
+      Buffer *buffer = (Buffer *)levels->staging;
+      InitialImageBuffer staging;
+      TextureFormatLayout layout;
+      tfl_init(&layout);
+      tfl_set_2d(&layout, info.format, info.width, info.height, 1, n);
+      buffer_add_reference(buffer);
+      staging.buffer = bh_make(buffer);
+      tfl_build_buffer_image_copies(&layout, staging.blits, &staging.num_blits);
+      device_unmap_host_buffer(self->device, buffer, MEMORY_ACCESS_WRITE_BIT);
+      image = device_create_image_from_staging_buffer(self->device, &info, &staging);
+      bh_reset(&staging.buffer);
+      return image;
+   }
+
    for (i = 0; i < n; i++) {
       initial[i].data = levels->levels[i].owned_data;
       initial[i].row_length = 0;
@@ -11477,6 +11687,58 @@ static TTGpuImage *vk_tt_upload_levels(void *ctx, const LoadedLevels *levels)
    Renderer *self = (Renderer *)ctx;
    ImageHandle h = renderer_upload_texture(self, (LoadedLevels *)levels);
    return (TTGpuImage *)ih_get(&h); /* carries the +1 from device_create_image */
+}
+
+/* Upload memory for a decoded chain: one persistently mapped, cached
+ * host buffer laid out as the copy into the image wants it, so the decoder
+ * writes the levels where the GPU copies them from. The buffer's last
+ * reference goes through the device's deferred destruction, so its memory is
+ * not reused before the frame that recorded a copy from it has retired.
+ * Without cached host memory (reading the level above to build each mip
+ * from uncached memory would be slow) there is none, and the levels go
+ * through device_create_image's staging copy as before. */
+static TTStaging *vk_tt_staging_alloc(void *ctx, int width, int height,
+      int levels, uint8_t **level_data)
+{
+   Renderer *self = (Renderer *)ctx;
+   Device   *device = self->device;
+   TextureFormatLayout layout;
+   BufferCreateInfo info;
+   BufferHandle buffer;
+   uint8_t *mapped;
+   int i;
+   if (self->hd_staging_uncached || levels <= 0 || levels > 16)
+      return NULL;
+   tfl_init(&layout);
+   tfl_set_2d(&layout, VK_FORMAT_R8G8B8A8_UNORM, width, height, 1, levels);
+   memset(&info, 0, sizeof(info));
+   info.domain = BufferDomain_CachedHost;
+   info.size   = tfl_get_required_size(&layout);
+   info.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+   buffer = device_create_buffer(device, &info, NULL);
+   if (!bh_get(&buffer))
+      return NULL;
+   if (!(device->mem_props.memoryTypes[bh_get(&buffer)->alloc.memory_type].propertyFlags
+            & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+      self->hd_staging_uncached = true;
+      bh_reset(&buffer);
+      return NULL;
+   }
+   mapped = (uint8_t *)device_map_host_buffer(device, bh_get(&buffer), MEMORY_ACCESS_WRITE_BIT);
+   if (!mapped) {
+      bh_reset(&buffer);
+      return NULL;
+   }
+   tfl_set_buffer(&layout, mapped, tfl_get_required_size(&layout));
+   for (i = 0; i < levels; i++)
+      level_data[i] = (uint8_t *)tfl_data(&layout, 0, (unsigned)i);
+   return (TTStaging *)bh_get(&buffer); /* the buffer's one reference */
+}
+
+static void vk_tt_staging_release(void *ctx, TTStaging *staging)
+{
+   (void)ctx;
+   buffer_release_reference((Buffer *)staging);
 }
 
 static void vk_tt_image_addref(void *ctx, TTGpuImage *img)
@@ -11622,6 +11884,8 @@ static TTGpuBackend vk_tt_make_backend(Renderer *self)
    vt.page_begin       = vk_tt_page_begin;
    vt.page_blit        = vk_tt_page_blit;
    vt.page_end         = vk_tt_page_end;
+   vt.staging_alloc    = vk_tt_staging_alloc;
+   vt.staging_release  = vk_tt_staging_release;
    return vt;
 }
 
@@ -11784,6 +12048,8 @@ static uint16_t *renderer_copy_cpu_to_vram(Renderer *self, const TTRect *rect,
 static void renderer_fini(Renderer *self)
 {
    renderer_flush(self);
+   psx_upscaler_free(self->upscaler);
+   self->upscaler = NULL;
    texture_tracker_free(self->tracker); /* heap tracker: explicit teardown */
    self->tracker = NULL;
    /* Release the ImageHandle members (previously dropped by implicit member
@@ -19219,6 +19485,18 @@ fail_jobs:
    }
 
    POD_VEC_DECLARE(VkFlagsVec, VkFlags);
+   /* The queue's tail fence, once a later submit follows it: waited and
+    * recycled with the frame, as any fence of the frame. */
+   static void device_retire_tail_fence(Device *self, QueueData *data)
+   {
+      if (data->tail_fence != VK_NULL_HANDLE)
+      {
+         FenceVec_push(&device_frame(self)->wait_fences, &data->tail_fence);
+         FenceVec_push(&device_frame(self)->recycle_fences, &data->tail_fence);
+         data->tail_fence = VK_NULL_HANDLE;
+      }
+   }
+
    static void device_submit_empty_inner(Device *self, CommandBufferType type, VkFence *fence,
          unsigned semaphore_count, Semaphore *semaphores){
             VkResult result;
@@ -19286,6 +19564,7 @@ fail_jobs:
       { bool queue_locked = device_queue_lock(self, queue);
       result = vkQueueSubmit(queue, 1, &submit, cleared_fence);
       device_queue_unlock(self, queue_locked); }
+      device_retire_tail_fence(self, data);
 
       if (result != VK_SUCCESS)
          LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
@@ -19519,7 +19798,9 @@ fail_jobs:
          }
       }
 
-      cleared_fence = fence ? fencemanager_request_cleared_fence(&self->managers.fence) : VK_NULL_HANDLE;
+      /* Asked for or not, the submit carries a fence: unasked, it becomes
+       * the queue's tail fence. */
+      cleared_fence = fencemanager_request_cleared_fence(&self->managers.fence);
 
       { unsigned i; for (i = 0; i < semaphore_count; i++) {
          VkSemaphore cleared_semaphore = semaphoremanager_request_cleared_semaphore(&self->managers.semaphore);
@@ -19565,6 +19846,7 @@ fail_jobs:
       device_queue_unlock(self, queue_locked); }
       if (result != VK_SUCCESS)
          LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
+      device_retire_tail_fence(self, data);
       cbhvec_clear(submissions);
 
       CommandBufferVec_free_storage(&cmds);
@@ -19594,7 +19876,14 @@ fail_jobs:
          data->need_fence = false;
       }
       else
+      {
+         /* A fence handed to a failed submit never signals: never a tail. */
+         if (result == VK_SUCCESS)
+            data->tail_fence = cleared_fence;
+         else if (cleared_fence != VK_NULL_HANDLE)
+            fencemanager_recycle_fence(&self->managers.fence, cleared_fence);
          data->need_fence = true;
+      }
       }
       }
    }
@@ -19640,36 +19929,36 @@ fail_jobs:
       device_submit_staging(self, &cmd, usage, false);
    }
 
-   static void device_end_frame_nolock(Device *self){
-      /* Make sure we have a fence which covers all submissions in the frame. */
+   /* The frame's fence for a queue: the tail fence when nothing was
+    * submitted or left waiting since, which covers the whole frame, else a
+    * submit of its own as ever. */
+   static void device_end_frame_queue(Device *self, CommandBufferType type)
+   {
+      QueueData *data = device_get_queue_data(self, type);
       VkFence fence;
 
-      if (self->transfer.need_fence || !cbhvec_empty(&device_frame(self)->transfer_submissions))
+      if (!data->need_fence && cbhvec_empty(device_get_queue_submissions(self, type)))
+         return;
+      if (data->tail_fence != VK_NULL_HANDLE
+            && cbhvec_empty(device_get_queue_submissions(self, type))
+            && sem_handle_vec_size(&data->wait_semaphores) == 0)
       {
-         fence = VK_NULL_HANDLE;
-         device_submit_queue(self, Type_AsyncTransfer, &fence, 0, NULL);
-         if (fence != VK_NULL_HANDLE)
-            FenceVec_push(&device_frame(self)->recycle_fences, &fence);
-         self->transfer.need_fence = false;
+         device_retire_tail_fence(self, data);
+         data->need_fence = false;
+         return;
       }
+      fence = VK_NULL_HANDLE;
+      device_submit_queue(self, type, &fence, 0, NULL);
+      if (fence != VK_NULL_HANDLE)
+         FenceVec_push(&device_frame(self)->recycle_fences, &fence);
+      data->need_fence = false;
+   }
 
-      if (self->graphics.need_fence || !cbhvec_empty(&device_frame(self)->graphics_submissions))
-      {
-         fence = VK_NULL_HANDLE;
-         device_submit_queue(self, Type_Generic, &fence, 0, NULL);
-         if (fence != VK_NULL_HANDLE)
-            FenceVec_push(&device_frame(self)->recycle_fences, &fence);
-         self->graphics.need_fence = false;
-      }
-
-      if (self->compute.need_fence || !cbhvec_empty(&device_frame(self)->compute_submissions))
-      {
-         fence = VK_NULL_HANDLE;
-         device_submit_queue(self, Type_AsyncCompute, &fence, 0, NULL);
-         if (fence != VK_NULL_HANDLE)
-            FenceVec_push(&device_frame(self)->recycle_fences, &fence);
-         self->compute.need_fence = false;
-      }
+   static void device_end_frame_nolock(Device *self){
+      /* Make sure we have a fence which covers all submissions in the frame. */
+      device_end_frame_queue(self, Type_AsyncTransfer);
+      device_end_frame_queue(self, Type_Generic);
+      device_end_frame_queue(self, Type_AsyncCompute);
    }
 
    static void device_flush_frame_nolock(Device *self){
@@ -22017,6 +22306,19 @@ extern retro_log_printf_t log_cb;
 static struct retro_hw_render_callback hw_render;
 static const struct retro_hw_render_interface_vulkan *vulkan;
 
+/* The frontend's temporal upscaler; see upscaler_poll below */
+static void upscaler_override_options(void);
+static void upscaler_get_interface(void);
+static void upscaler_release_ring(void);
+static void upscaler_poll(void);
+static unsigned upscaler_jitter_phase(void);
+static void upscaler_hand_over(Renderer *r, Image *scanout, unsigned index);
+static const struct retro_hw_render_upscaler_interface *upscaler_iface;
+static bool upscaler_on;
+static bool upscaler_reset_pending = true;
+/* What the renderer was built for (it may have settled for less) */
+static unsigned built_scaling, built_msaa;
+
 /* Owning vector of retro_vulkan_image (POD), replacing A dynamic array of
  * retro_vulkan_image. resize() grows/shrinks the backing array; grown slots are
  * zero-initialised. */
@@ -22291,6 +22593,8 @@ static void vk_context_reset(void)
    device_set_context(device, *&context);
 
    renderer = (Renderer *)malloc(sizeof(Renderer));
+   built_scaling = scaling;
+   built_msaa    = msaa;
    renderer_init(renderer, device, scaling, msaa, owned_u32_empty(&save_state.vram) ? NULL : &save_state);
    if (!renderer_is_valid(renderer))
    {
@@ -22306,6 +22610,7 @@ static void vk_context_reset(void)
 
    tt_log_startup("vk renderer init: scaling=%u msaa=%u has_software_fb=%d\n",
          (unsigned)scaling, (unsigned)msaa, (int)has_software_fb);
+   upscaler_get_interface();
 
    /* Replay any rhi_vulkan_* state-sets / VRAM uploads that arrived
     * between rhi_vulkan_open's SET_HW_RENDER and this context_reset
@@ -22333,6 +22638,8 @@ static void vk_context_destroy(void)
    savestate_destroy(&save_state);
    renderer_save_vram_state(renderer, &save_state);
    vulkan     = NULL;
+   upscaler_iface = NULL;
+   upscaler_release_ring();
    scanouthandlevec_free_storage(&scanout_handles);
    swapchainimagevec_free_storage(&swapchain_images);
 
@@ -22460,6 +22767,11 @@ bool rhi_vulkan_open(bool is_pal)
    hw_render.cache_context   = false;
    if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
       return false;
+
+   /* Asked for here so the frontend makes the context for its temporal
+    * upscaler; the interface comes after context_reset */
+   { const struct retro_hw_render_upscaler_interface *iface = NULL;
+   environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_UPSCALER_INTERFACE, &iface); }
 
    /* v2 where the frontend has it, so it makes the device and can add
     * what it needs; a frontend that predates v2 rejects a v2 interface. */
@@ -22626,6 +22938,7 @@ void rhi_vulkan_refresh_variables(void)
    {
       msaa = strtoul(var.value, NULL, 0);
    }
+   upscaler_override_options();
 
    var.key = BEETLE_OPT(mdec_yuv);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -22870,6 +23183,258 @@ void rhi_vulkan_refresh_variables(void)
    }
 }
 
+/* The frontend's temporal upscaler (RETRO_ENVIRONMENT_GET_HW_RENDER_UPSCALER_INTERFACE).
+ * While it takes the frames, the internal resolution is the factor that
+ * fits the size it asks for, without multisampling or supersampling,
+ * which would blur what it antialiases itself (adaptive smoothing
+ * stays: it smooths native-resolution 2D art, which an upscaler keeps
+ * as the detail it is), and the renderer jitters the primitives and
+ * hands over their motion vectors, depth and transparency mask with
+ * each frame. */
+static struct retro_hw_upscaler_request upscaler_request;
+static struct retro_hw_upscaler_inputs upscaler_inputs;
+static bool upscaler_options_hidden;
+/* The factor it picked, for frames of this native size, the size of
+ * the frame shown last */
+static unsigned upscaler_factor;
+static unsigned upscaler_picked_width, upscaler_picked_height;
+static unsigned upscaler_native_width = 320, upscaler_native_height = 240;
+/* Its pass's images per sync index: motion vectors, depth, mask. They
+ * live as long as the colour image of the same frame. */
+#define UPSCALER_RING 16
+static ImageHandle upscaler_ring[UPSCALER_RING][3];
+
+static void upscaler_release_ring(void)
+{
+   unsigned i, k;
+   for (i = 0; i < UPSCALER_RING; i++)
+      for (k = 0; k < 3; k++)
+         ih_reset(&upscaler_ring[i][k]);
+}
+
+/* Halton (2, 3) over the frames the ratio of the sizes wants: at least
+ * 8, at most 64 */
+static unsigned upscaler_jitter_phase(void)
+{
+   float ratio;
+   unsigned phase;
+   if (!upscaler_native_width || !upscaler_factor)
+      return 8;
+   ratio = (float)upscaler_request.output_width / (float)(upscaler_native_width * upscaler_factor);
+   phase = (unsigned)ceilf(8.0f * ratio * ratio);
+   return phase < 8 ? 8 : phase > 64 ? 64 : phase;
+}
+
+/* The options the upscaler overrides while it draws, and hides */
+static void upscaler_override_options(void)
+{
+   static const char *const keys[] = {
+      BEETLE_OPT(internal_resolution),
+      BEETLE_OPT(msaa),
+      BEETLE_OPT(super_sampling),
+      NULL
+   };
+   struct retro_core_option_display display;
+   unsigned i;
+
+   if (upscaler_on)
+   {
+      scaling        = upscaler_factor;
+      msaa           = 1;
+      super_sampling = false;
+   }
+   if (upscaler_on == upscaler_options_hidden)
+      return;
+   upscaler_options_hidden = upscaler_on;
+   display.visible         = !upscaler_on;
+   for (i = 0; keys[i]; i++)
+   {
+      display.key = keys[i];
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &display);
+   }
+}
+
+/* Says what the upscaler asked for and what came of it, when that
+ * changes */
+static void upscaler_log(bool requested, bool on, unsigned factor)
+{
+   static bool last_requested, last_on;
+   static unsigned last_factor, last_w, last_h;
+   const struct retro_hw_upscaler_request *r = &upscaler_request;
+   if (requested == last_requested && on == last_on && factor == last_factor
+         && (!on || (last_w == upscaler_native_width && last_h == upscaler_native_height)))
+      return;
+   last_requested = requested;
+   last_on        = on;
+   last_factor    = factor;
+   last_w         = upscaler_native_width;
+   last_h         = upscaler_native_height;
+   if (!requested)
+      LOGI("[Vulkan]: Temporal upscaler: no request, rendering as usual.\n");
+   else if (!on)
+      LOGI("[Vulkan]: Temporal upscaler: asks for %ux%u (%ux%u to %ux%u) for %ux%u; "
+            "no factor of %ux%u fits, rendering as usual.\n",
+            r->render_width, r->render_height, r->min_render_width, r->min_render_height,
+            r->max_render_width, r->max_render_height, r->output_width, r->output_height,
+            upscaler_native_width, upscaler_native_height);
+   else
+      LOGI("[Vulkan]: Temporal upscaler: drawing at %ux, %ux%u, for %ux%u "
+            "(asks for %ux%u, %ux%u to %ux%u).\n",
+            factor, upscaler_native_width * factor, upscaler_native_height * factor,
+            r->output_width, r->output_height, r->render_width, r->render_height,
+            r->min_render_width, r->min_render_height, r->max_render_width, r->max_render_height);
+}
+
+/* Once a frame, before it is drawn: whether it is drawn for the
+ * upscaler and at what factor. A factor other than the renderer's is a
+ * geometry change, applied before the next frame as an option's is. */
+static void upscaler_poll(void)
+{
+   bool requested = false;
+   bool on        = false;
+   unsigned factor = 0;
+
+   if (upscaler_iface && upscaler_iface->get_request(upscaler_iface->handle, &upscaler_request))
+   {
+      static struct retro_hw_upscaler_request last_request;
+      psx_upscaler_range_t range;
+      /* a changed request (the output changed) is picked for afresh */
+      bool changed      = memcmp(&last_request, &upscaler_request, sizeof(last_request)) != 0;
+      last_request      = upscaler_request;
+      requested         = true;
+      range.want_width  = upscaler_request.render_width;
+      range.min_width   = upscaler_request.min_render_width;
+      range.min_height  = upscaler_request.min_render_height;
+      range.max_width   = upscaler_request.max_render_width;
+      range.max_height  = upscaler_request.max_render_height;
+      factor = psx_upscaler_factor(&range, upscaler_native_width, upscaler_native_height, 16,
+            upscaler_on && !changed ? upscaler_factor : 0, upscaler_picked_width, upscaler_picked_height);
+      on = factor != 0;
+   }
+   if (on != upscaler_on)
+      upscaler_reset_pending = true;
+   if (on && (factor != upscaler_factor || !upscaler_on))
+   {
+      upscaler_factor        = factor;
+      upscaler_picked_width  = upscaler_native_width;
+      upscaler_picked_height = upscaler_native_height;
+   }
+   if (upscaler_on && !on)
+   {
+      /* back to the options as set (a geometry change when they differ) */
+      upscaler_on = false;
+      rhi_vulkan_refresh_variables();
+   }
+   else if (on)
+   {
+      /* the renderer follows at the frame boundary
+       * (rhi_vulkan_apply_pending_geometry); the maximum size reported
+       * stays the options', which only sizes a frontend's software
+       * frame scratch */
+      upscaler_on = true;
+      upscaler_override_options();
+   }
+   if (upscaler_iface)
+      upscaler_log(requested, on, factor);
+}
+
+static void upscaler_get_interface(void)
+{
+   const struct retro_hw_render_upscaler_interface *iface = NULL;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_UPSCALER_INTERFACE, &iface) || !iface
+         || iface->interface_version != RETRO_HW_RENDER_UPSCALER_INTERFACE_VERSION)
+      iface = NULL;
+   upscaler_iface         = iface;
+   upscaler_reset_pending = true;
+}
+
+static uint64_t upscaler_vk_handle(const void *handle, size_t size)
+{
+   uint64_t value = 0;
+   memcpy(&value, handle, size < sizeof(value) ? size : sizeof(value));
+   return value;
+}
+
+static void upscaler_image(struct retro_hw_upscaler_image *out, Image *image)
+{
+   VkImage img      = image_get_image(image);
+   VkImageView view = imageview_get_view(image_get_view(image));
+   out->image  = upscaler_vk_handle(&img, sizeof(img));
+   out->view   = upscaler_vk_handle(&view, sizeof(view));
+   out->format = image_get_format(image);
+   out->state  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+   out->width  = image_get_width(image, 0);
+   out->height = image_get_height(image, 0);
+}
+
+/* The frame's pass, in the images of its sync index, and its inputs
+ * handed over; nothing when the frame is not one the upscaler can take
+ * (VRAM shown whole, a black screen) */
+static void upscaler_hand_over(Renderer *r, Image *scanout, unsigned index)
+{
+   static const VkFormat formats[3] = { VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R8_UNORM };
+   unsigned width  = image_get_width(scanout, 0);
+   unsigned height = image_get_height(scanout, 0);
+   unsigned scale  = r->scaling;
+   psx_upscaler_geometry_t geometry;
+   DisplayRect display_rect;
+   unsigned k;
+
+   if (!upscaler_on || !upscaler_iface || show_vram || index >= UPSCALER_RING
+         || !r->render_state.display_on || !r->render_state.display_fb_rect.width
+         || width < scale || height < scale)
+   {
+      if (upscaler_iface)
+         upscaler_iface->set_inputs(upscaler_iface->handle, NULL);
+      return;
+   }
+
+   for (k = 0; k < 3; k++)
+   {
+      Image *img = ih_get(&upscaler_ring[index][k]);
+      if (!img || image_get_width(img, 0) != width || image_get_height(img, 0) != height)
+      {
+         ImageCreateInfo info = image_create_info_render_target(width, height, formats[k]);
+         info.initial_layout  = VK_IMAGE_LAYOUT_UNDEFINED;
+         info.usage           = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+         ih_move(&upscaler_ring[index][k], device_create_image(r->device, &info, NULL));
+         if (!ih_get(&upscaler_ring[index][k]))
+         {
+            upscaler_iface->set_inputs(upscaler_iface->handle, NULL);
+            return;
+         }
+      }
+   }
+
+   /* The image's pixel (0, 0) shows the VRAM pixel the display's window
+    * starts at, as the scanout places its framebuffer rectangle */
+   display_rect = renderer_compute_display_rect(r);
+   psx_upscaler_resolve(r->upscaler,
+         (int)r->render_state.display_fb_rect.x - display_rect.x,
+         (int)r->render_state.display_fb_rect.y - display_rect.y,
+         width / scale, height / scale, scale, &geometry);
+   upscaler_native_width  = width / scale;
+   upscaler_native_height = height / scale;
+   renderer_upscaler_pass(r, &geometry, width, height,
+         ih_get(&upscaler_ring[index][0]), ih_get(&upscaler_ring[index][1]), ih_get(&upscaler_ring[index][2]));
+
+   memset(&upscaler_inputs, 0, sizeof(upscaler_inputs));
+   upscaler_inputs.flags = geometry.reset ? RETRO_HW_UPSCALER_RESET : 0;
+   if (psx_hdr_active && psx_hdr_scrgb)
+      upscaler_inputs.flags |= RETRO_HW_UPSCALER_HDR;
+   upscaler_image(&upscaler_inputs.motion_vectors, ih_get(&upscaler_ring[index][0]));
+   upscaler_image(&upscaler_inputs.depth, ih_get(&upscaler_ring[index][1]));
+   upscaler_image(&upscaler_inputs.transparency_mask, ih_get(&upscaler_ring[index][2]));
+   upscaler_inputs.jitter_x       = geometry.jitter_x;
+   upscaler_inputs.jitter_y       = geometry.jitter_y;
+   upscaler_inputs.mv_scale_x     = 1.0f;
+   upscaler_inputs.mv_scale_y     = 1.0f;
+   upscaler_inputs.pre_exposure   = 1.0f;
+   upscaler_inputs.exposure_scale = 1.0f;
+   upscaler_inputs.frame_time_ms  = (float)(1000.0 / rhi_common_get_timing_fps());
+   upscaler_iface->set_inputs(upscaler_iface->handle, &upscaler_inputs);
+}
+
 static void ensure_sync_index_resources(void)
 {
    unsigned mask = vulkan->get_sync_index_mask(vulkan->handle);
@@ -22885,24 +23450,57 @@ static void ensure_sync_index_resources(void)
    }
 }
 
-/* Perform a renderer rebuild that rhi_vulkan_refresh_variables deferred (a
- * scaling / super_sampling / msaa change). Called from the top of prepare_frame
- * BEFORE the frame is begun on the device, so the renderer is torn down and
- * rebuilt between frames -- never under work already submitted for an in-flight
- * frame. Preserves VRAM across the rebuild exactly as vk_context_reset does
- * (save -> idle -> release scanout handles -> fini -> init with the saved
- * state). */
+/* Rebuilds the renderer at the scaling and msaa now set, on the same
+ * device and context, with VRAM and its state carried over as
+ * vk_context_reset carries them: no frontend reinit, no swapchain or
+ * upscaler feature torn down, the programs and pipelines kept. Between
+ * frames only. */
+static void rhi_vulkan_rebuild_renderer(void)
+{
+   SaveState st;
+   if (!renderer || !device)
+      return;
+   renderer_save_vram_state(renderer, &st);
+   renderer_fini(renderer);
+   free(renderer);
+   renderer = (Renderer *)malloc(sizeof(Renderer));
+   built_scaling = scaling;
+   built_msaa    = msaa;
+   renderer_init(renderer, device, scaling, msaa, &st);
+   savestate_destroy(&st);
+   if (!renderer_is_valid(renderer))
+   {
+      renderer_fini(renderer);
+      free(renderer);
+      renderer = NULL;
+      return;
+   }
+   upscaler_reset_pending = true;
+   tt_log_startup("vk renderer rebuilt: scaling=%u msaa=%u\n",
+         (unsigned)scaling, (unsigned)msaa);
+}
+
+/* Fire a geometry change rhi_vulkan_refresh_variables deferred, and
+ * rebuild the renderer where it no longer matches the scaling or msaa
+ * set (the frontend reinitialises its video only when the maximum size
+ * changed; the temporal upscaler's factor never goes through it).
+ * Called from the top of retro_run BEFORE prepare_frame begins a frame,
+ * so the frontend's synchronous video-driver reinit
+ * (context_destroy/context_reset) and the rebuild run with no frame in
+ * flight and nothing from this core on the call stack below it. */
 void rhi_vulkan_apply_pending_geometry(void)
 {
-   /* Fire a deferred geometry change recorded by refresh_variables. Called from
-    * the top of retro_run BEFORE prepare_frame begins a frame, so the frontend's
-    * synchronous video-driver reinit (context_destroy/context_reset) runs with
-    * no frame in flight and nothing from this core on the call stack below it. */
    if (geometry_change_pending)
    {
       struct retro_system_av_info info = pending_av_info;
       geometry_change_pending = false;
       environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
+   }
+   if (device && renderer)
+   {
+      upscaler_poll();
+      if (renderer && (built_scaling != scaling || built_msaa != msaa))
+         rhi_vulkan_rebuild_renderer();
    }
 }
 
@@ -22948,6 +23546,12 @@ static void renderer_reduce_cached_color(Renderer *self)
    ih_reset(&self->last_scanout);
 }
 
+/* Out of line: a frame rarely starts with work recorded. */
+static RHI_NOINLINE void renderer_flush_between_frames(Renderer *self)
+{
+   renderer_flush(self);
+}
+
 void rhi_vulkan_prepare_frame(void)
 {
    enum dither_mode pattern = psx_hdr_active ? DITHER_OFF : psx_gpu_dither_mode;
@@ -22970,6 +23574,9 @@ void rhi_vulkan_prepare_frame(void)
       return;
    }
 
+   /* Uploads recorded between frames, a state load's, go first. */
+   if (renderer && cbh_is_valid(&renderer->cmd))
+      renderer_flush_between_frames(renderer);
    inside_frame = true;
    device_flush_frame_nolock(device);
    vulkan->wait_sync_index(vulkan->handle);
@@ -22981,6 +23588,12 @@ void rhi_vulkan_prepare_frame(void)
    if (renderer == NULL)
       return;
    renderer->upload_serial++;
+
+   psx_upscaler_configure(renderer->upscaler, upscaler_on && !show_vram,
+         upscaler_jitter_phase(), upscaler_reset_pending);
+   upscaler_reset_pending = false;
+   if (!psx_upscaler_is_active(renderer->upscaler))
+      renderer->upscaler_jitter_x = renderer->upscaler_jitter_y = 0.0f;
 
    renderer->scaled_uv_offset = scaled_uv_offset;
    renderer->primitive_filter_mode = (FilterMode)(filter_mode);
@@ -23143,6 +23756,7 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
    image->image_view                                  = 
       imageview_get_view(image_get_view(ih_get(&scanout)));
 
+   upscaler_hand_over(renderer, ih_get(&scanout), index);
    vulkan->set_image(vulkan->handle, image, 0,
          NULL, VK_QUEUE_FAMILY_IGNORED);
    renderer_flush(renderer);
@@ -23598,9 +24212,6 @@ void rhi_vulkan_load_image(
       }
       device_unmap_host_buffer(renderer->device, mapped, MEMORY_ACCESS_WRITE_BIT);
 
-      /* This is called on state loading. */
-      if (!inside_frame)
-         renderer_flush(renderer);
       /* The staging buffer of its own, when the ring could not hold the
        * rect; the recorded copy keeps its own reference. */
       bh_reset(&handle);
