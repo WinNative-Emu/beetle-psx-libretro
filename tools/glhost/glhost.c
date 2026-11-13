@@ -80,7 +80,7 @@ static EGLDisplay egl_dpy;
 static EGLContext egl_ctx;
 static GLuint fbo, fbo_tex, fbo_depth;
 static unsigned fbo_w = 4096, fbo_h = 4096;
-static unsigned last_w, last_h, frames_presented;
+static unsigned last_w, last_h, frames_presented, frames_duped;
 /* GLHOST_CTX: "core" (default) = accept OPENGL_CORE or OPENGL on a core
  * context; "gl2" = simulate the modern RetroArch gl driver: answer
  * GET_PREFERRED_HW_RENDER with RETRO_HW_CONTEXT_OPENGL, accept ONLY that,
@@ -372,18 +372,20 @@ static bool env_cb(unsigned cmd, void *data)
 }
 
 /* ---- video/audio/input stubs ---- */
+typedef void (*bindfb_t)(GLenum, GLuint);
+
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
 {
   if (width != last_w || height != last_h)
      fprintf(stderr, "[glhost] geometry %ux%u\n", width, height);
   last_w = width; last_h = height; frames_presented++;
+  if (!data) frames_duped++;
   if ((!data || data == (const void *)-1) && getenv("GLHOST_FRAMEHASH")
       && width && height)
   {
      /* hw-render frame: hash a readback of the host FBO the core just
       * rendered into, so GL runs get the same equivalence oracle. */
      size_t need = (size_t)width * height * 4;
-     typedef void (*bindfb_t)(GLenum, GLuint);
      bindfb_t pbind = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
      if (need > soft_cap) { free(soft_buf); soft_buf = malloc(need); soft_cap = need; }
      if (soft_buf && pbind)
@@ -477,7 +479,6 @@ static int egl_init(void)
 static int fbo_init(void)
 {
    typedef void (*genfb_t)(GLsizei, GLuint *);
-   typedef void (*bindfb_t)(GLenum, GLuint);
    typedef void (*fbtex_t)(GLenum, GLenum, GLenum, GLuint, GLint);
    typedef GLenum (*checkfb_t)(GLenum);
    genfb_t  pglGenFramebuffers  = (genfb_t)eglGetProcAddress("glGenFramebuffers");
@@ -515,6 +516,9 @@ static void fbo_make_fp16(void)
 
 static void dump_frame(const char *path)
 {
+   unsigned char *buf;
+   FILE *f;
+   bindfb_t pglBindFramebuffer;
    unsigned w = last_w ? last_w : 640, h = last_h ? last_h : 480;
    if (soft_mode)
    {
@@ -548,10 +552,8 @@ static void dump_frame(const char *path)
       fprintf(stderr, "[glhost] dumped %s (%ux%u soft)\n", path, soft_w, soft_h);
       return;
    }
-   unsigned char *buf = malloc((size_t)w * h * 4);
-   FILE *f;
-   typedef void (*bindfb_t)(GLenum, GLuint);
-   bindfb_t pglBindFramebuffer = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
+   buf = malloc((size_t)w * h * 4);
+   pglBindFramebuffer = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
    if (!buf) return;
    pglBindFramebuffer(GL_FRAMEBUFFER, fbo);
    if (fbo_fp16)
@@ -877,6 +879,7 @@ int main(int argc, char **argv)
            gl_rect_pixels - gl_rect_pixels_half);
    fprintf(stderr, "[glhost] done: %d frames run, %u presented, last %ux%u\n",
            frames, frames_presented, last_w, last_h);
+   fprintf(stderr, "[glhost] duped: %u frames sent as NULL\n", frames_duped);
 
    { const char *ro = getenv("GLHOST_RAM_OUT");
      if (ro)

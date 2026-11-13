@@ -126,7 +126,7 @@ static VkPhysicalDevice gpu;
 static VkDebugUtilsMessengerEXT messenger;
 static int validation_errors, validation_warnings;
 static const struct retro_vulkan_image *last_image;
-static unsigned frame_valid;
+static unsigned frame_valid, frame_duped;
 static unsigned last_w, last_h;
 static char sysdir[512] = "/tmp/vkhost_sys";
 static char savedir[512] = "/tmp/vkhost_save";
@@ -956,7 +956,7 @@ static void host_reinit_context(void)
 }
 
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
-{ (void)pitch; if (data == RETRO_HW_FRAME_BUFFER_VALID) { frame_valid++;
+{ (void)pitch; if (!data) frame_duped++; if (data == RETRO_HW_FRAME_BUFFER_VALID) { frame_valid++;
    if (last_w != width || last_h != height)
       fprintf(stderr, "[vkhost] geometry %ux%u\n", width, height);
    last_w = width; last_h = height;
@@ -1238,10 +1238,10 @@ int main(int argc, char **argv)
    int frames = 120;
    const char *outdir = "/tmp/vkhost_out";
    const char *next_content = getenv("VKHOST_NEXT_CONTENT");
-   if (getenv("VKHOST_NEGOTIATION"))
-      negotiation_offer = (unsigned)atoi(getenv("VKHOST_NEGOTIATION"));
    char next_outdir[600];
    char cmdbuf[1024];
+   if (getenv("VKHOST_NEGOTIATION"))
+      negotiation_offer = (unsigned)atoi(getenv("VKHOST_NEGOTIATION"));
 
    if (argc < 3)
    { fprintf(stderr, "usage: %s core content [state] [frames] [outdir]\n", argv[0]); return 2; }
@@ -1396,14 +1396,6 @@ run_frames_sw:
       struct timespec t0, t1;
       void (*retro_run_fn)(void) = dlsym(core, "retro_run");
 
-      if (bench)
-      {
-         const char *e = getenv("VKHOST_BENCH_SKIP");
-         bench_skip = e ? atoi(e) : 120;
-         if (bench_skip >= frames)
-            bench_skip = frames / 4;
-      }
-
       typedef bool   (*vk_ser_t)(void *, size_t);
       typedef bool   (*vk_unser_t)(const void *, size_t);
       typedef size_t (*vk_ssize_t)(void);
@@ -1418,6 +1410,15 @@ run_frames_sw:
       void      *pbuf = NULL, *pbuf2 = NULL;
       size_t     pcap = 0;
       int        have_prev = 0;
+
+      if (bench)
+      {
+         const char *e = getenv("VKHOST_BENCH_SKIP");
+         bench_skip = e ? atoi(e) : 120;
+         if (bench_skip >= frames)
+            bench_skip = frames / 4;
+      }
+
       for (i = 0; i < frames; i++)
       {
          cur_frame = i;
@@ -1596,6 +1597,7 @@ run_frames_sw:
            " %d unlocked uses of the frontend's queue, %d waits with its lock held\n",
            frames, frame_valid, validation_errors, validation_warnings,
            queue_violations, queue_waits_locked);
+   fprintf(stderr, "[vkhost] duped: %u frames sent as NULL\n", frame_duped);
    { const char *ro = getenv("VKHOST_RAM_OUT");
      if (ro)
      {
@@ -1635,6 +1637,7 @@ run_frames_sw:
       negotiation = NULL;
       last_image  = NULL;
       frame_valid = 0;
+      frame_duped = 0;
       last_w = last_h = 0;
       fprintf(stderr, "[vkhost] next session: %s\n", content);
       goto session;
