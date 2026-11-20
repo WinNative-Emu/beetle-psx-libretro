@@ -16,6 +16,28 @@
  *   VKHOST_PREEMPT=1: model RetroArch's Preemptive Frames (rollback by
  *     one frame, glhost's GLHOST_PREEMPT=2): every frame restore the state
  *     saved before the previous one, replay that frame, save, then run.
+ *   VKHOST_LIFETIME=1: with VKHOST_PREEMPT, take the core's savestate
+ *     lifetime callbacks (RETRO_ENVIRONMENT_SET_SAVESTATE_LIFETIME) as
+ *     RetroArch does: the rollback's states are saved and loaded in the
+ *     managed context, a buffer's state is released before another is saved
+ *     into it, every one is released before context_destroy, and
+ *     GET_EXECUTION_PHASE reports the replay as REPLAY. Ends with how many
+ *     managed saves, releases and refused loads there were.
+ *   VKHOST_RUNAHEAD=N: model RetroArch's Run-Ahead on one instance, N
+ *     frames ahead: every frame load the state saved last, run the kept
+ *     frame with video off, save, then run N frames speculatively, the
+ *     last with video on. Video on or off is reported through
+ *     GET_AUDIO_VIDEO_ENABLE and the execution phase through
+ *     GET_EXECUTION_PHASE; as a frontend, the host throws away what a
+ *     frame run with video off hands it (set_image and video_refresh).
+ *     Ends with how many of those frames the core drew all the same.
+ *   VKHOST_AV_ALWAYS=1: with VKHOST_RUNAHEAD, report video on for every
+ *     frame (the frames are still thrown away), as a frontend that does
+ *     not tell the core.
+ *   VKHOST_LIFETIME_EARLY_RELEASE=N: with VKHOST_LIFETIME, release the state
+ *     about to be loaded on frame N before loading it, as a frontend that
+ *     breaks the contract would; the core should refuse that load when the
+ *     state needs what the release dropped.
  *   VKHOST_VARS_AT: semicolon list of frame:key=value option changes, each
  *     applied before that frame's retro_run and reported through
  *     GET_VARIABLE_UPDATE, as a frontend does when the user edits an option
@@ -127,6 +149,9 @@ static VkDebugUtilsMessengerEXT messenger;
 static int validation_errors, validation_warnings;
 static const struct retro_vulkan_image *last_image;
 static unsigned frame_valid, frame_duped;
+/* VKHOST_RUNAHEAD: the frame being run is thrown away */
+static int  ra_hidden, ra_av_always;
+static long ra_hidden_drawn;
 static unsigned last_w, last_h;
 static char sysdir[512] = "/tmp/vkhost_sys";
 static char savedir[512] = "/tmp/vkhost_save";
@@ -156,6 +181,8 @@ static void log_cb(enum retro_log_level level, const char *fmt, ...)
 static void vk_set_image(void *handle, const struct retro_vulkan_image *image,
       uint32_t num_semaphores, const VkSemaphore *semaphores, uint32_t src_queue_family)
 { (void)handle; (void)num_semaphores; (void)semaphores; (void)src_queue_family;
+   if (ra_hidden)
+      return;
    if (!last_image || last_image->create_info.image != image->create_info.image ||
        last_image->create_info.format != image->create_info.format)
       fprintf(stderr, "[vkhost] set_image img=%p fmt=%d layout=%d extent-hint=%ux%u\n",
@@ -754,6 +781,36 @@ static void up_dump_images(const char *outdir, int n)
 }
 
 /* ---- environment ---- */
+/* VKHOST_LIFETIME: the core's lifetime callbacks and the rollback's two
+ * state buffers, with whether each holds a managed state */
+static int lt_on;
+static int lt_managed_ctx;
+static enum retro_execution_phase lt_phase = RETRO_EXECUTION_PHASE_RETAINED;
+static struct retro_savestate_lifetime lt_iface;
+static void  *lt_buf[2];
+static size_t lt_size;
+static int    lt_owned[2];
+static long   lt_saves, lt_releases, lt_refused;
+static int    ra_frames;
+static int    lt_early_release = -1;
+
+static void lt_release(int i)
+{
+   if (lt_owned[i] && lt_iface.release)
+   {
+      lt_iface.release(lt_buf[i], lt_size);
+      lt_releases++;
+   }
+   lt_owned[i] = 0;
+}
+
+/* Before the core's context goes: nothing it held may outlive it */
+static void lt_release_all(void)
+{
+   lt_release(0);
+   lt_release(1);
+}
+
 static bool env_cb(unsigned cmd, void *data)
 {
    switch (cmd)
@@ -868,6 +925,34 @@ static bool env_cb(unsigned cmd, void *data)
       case RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE:
          *(const struct retro_hw_render_interface_vulkan **)data = &iface;
          return true;
+      case RETRO_ENVIRONMENT_SET_SAVESTATE_LIFETIME:
+      {
+         const struct retro_savestate_lifetime *l =
+            (const struct retro_savestate_lifetime *)data;
+         if (!lt_on || !l || l->version < 1
+               || l->version > RETRO_SAVESTATE_LIFETIME_VERSION || !l->release)
+            return false;
+         lt_iface = *l;
+         fprintf(stderr, "[vkhost] savestate lifetime registered\n");
+         return true;
+      }
+      case RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT:
+         if (data)
+            *(int *)data = lt_managed_ctx
+               ? RETRO_SAVESTATE_CONTEXT_SAME_INSTANCE_MANAGED
+               : RETRO_SAVESTATE_CONTEXT_NORMAL;
+         return true;
+      case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
+         if (!ra_frames)
+            return false;
+         if (data)
+            *(int *)data = RETRO_AV_ENABLE_AUDIO
+               | (ra_hidden && !ra_av_always ? 0 : RETRO_AV_ENABLE_VIDEO);
+         return true;
+      case RETRO_ENVIRONMENT_GET_EXECUTION_PHASE:
+         if (data)
+            *(enum retro_execution_phase *)data = lt_phase;
+         return true;
       case RETRO_ENVIRONMENT_GET_HDR_METADATA:
       case RETRO_ENVIRONMENT_GET_DISPLAY_METADATA:
          return host_hdr_metadata(cmd, data);
@@ -941,6 +1026,7 @@ static void host_reinit_context(void)
    host_unlock_queue();
    context_live = 0;
    up_readback_free();
+   lt_release_all();
    hw_render.context_destroy();
    if (negotiation && negotiation->destroy_device)
       negotiation->destroy_device();
@@ -956,13 +1042,18 @@ static void host_reinit_context(void)
 }
 
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
-{ (void)pitch; if (!data) frame_duped++; if (data == RETRO_HW_FRAME_BUFFER_VALID) { frame_valid++;
+{ (void)pitch;
+   if (ra_hidden) { if (data == RETRO_HW_FRAME_BUFFER_VALID) ra_hidden_drawn++; return; }
+   if (!data) frame_duped++;
+   if (data == RETRO_HW_FRAME_BUFFER_VALID) { frame_valid++;
    if (last_w != width || last_h != height)
       fprintf(stderr, "[vkhost] geometry %ux%u\n", width, height);
    last_w = width; last_h = height;
    if (up_on) up_log_frame(frame_valid, width, height); } }
 static void input_poll_cb(void) {}
 static int cur_frame;
+
+
 /* VKHOST_INPUT: comma list of first-last:joypad_id held ranges, e.g.
  * "20-30:3,60-300:4" (3=START, 4=UP per RETRO_DEVICE_ID_JOYPAD_*). */
 static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, unsigned id)
@@ -1242,6 +1333,12 @@ int main(int argc, char **argv)
    char cmdbuf[1024];
    if (getenv("VKHOST_NEGOTIATION"))
       negotiation_offer = (unsigned)atoi(getenv("VKHOST_NEGOTIATION"));
+   lt_on = getenv("VKHOST_LIFETIME") != NULL;
+   if (getenv("VKHOST_RUNAHEAD"))
+      ra_frames = atoi(getenv("VKHOST_RUNAHEAD"));
+   ra_av_always = getenv("VKHOST_AV_ALWAYS") != NULL;
+   if (getenv("VKHOST_LIFETIME_EARLY_RELEASE"))
+      lt_early_release = atoi(getenv("VKHOST_LIFETIME_EARLY_RELEASE"));
 
    if (argc < 3)
    { fprintf(stderr, "usage: %s core content [state] [frames] [outdir]\n", argv[0]); return 2; }
@@ -1422,7 +1519,53 @@ run_frames_sw:
       for (i = 0; i < frames; i++)
       {
          cur_frame = i;
-         if (preempt && ser && unser && ssz)
+         if (preempt && ser && unser && ssz && lt_iface.release)
+         {
+            /* As RetroArch's Preemptive Frames with a core that registered
+             * lifetime callbacks: lt_buf[0] is the state before the
+             * previous frame, lt_buf[1] the one about to be saved */
+            size_t need;
+            lt_managed_ctx = 1;
+            need = ssz();
+            lt_managed_ctx = 0;
+            if (need > lt_size)
+            {
+               lt_release_all();
+               free(lt_buf[0]); free(lt_buf[1]);
+               lt_buf[0] = malloc(need); lt_buf[1] = malloc(need); lt_size = need;
+            }
+            if (lt_buf[0] && lt_buf[1])
+            {
+               if (have_prev)
+               {
+                  if (i == lt_early_release)
+                     lt_release(0);
+                  lt_managed_ctx = 1;
+                  if (!unser(lt_buf[0], lt_size))
+                  {
+                     lt_refused++;
+                     fprintf(stderr, "[vkhost] rollback unser FAILED frame %d\n", i);
+                  }
+                  lt_managed_ctx = 0;
+                  lt_phase = RETRO_EXECUTION_PHASE_REPLAY;
+                  retro_run_fn();   /* replay the previous frame */
+                  lt_phase = RETRO_EXECUTION_PHASE_RETAINED;
+               }
+               lt_release(1);
+               lt_managed_ctx = 1;
+               lt_owned[1] = ser(lt_buf[1], lt_size);
+               lt_managed_ctx = 0;
+               if (lt_owned[1])
+                  lt_saves++;
+               else
+                  fprintf(stderr, "[vkhost] rollback ser FAILED frame %d\n", i);
+               { void *t = lt_buf[0]; int o = lt_owned[0];
+                 lt_buf[0] = lt_buf[1]; lt_owned[0] = lt_owned[1];
+                 lt_buf[1] = t; lt_owned[1] = o; }
+               have_prev = 1;
+            }
+         }
+         else if (preempt && ser && unser && ssz)
          {
             size_t need = ssz();
             if (need > pcap)
@@ -1443,6 +1586,29 @@ run_frames_sw:
                { void *t = pbuf; pbuf = pbuf2; pbuf2 = t; }
                have_prev = 1;
             }
+         }
+         if (ra_frames > 0 && ser && unser && ssz)
+         {
+            int k;
+            size_t need = ssz();
+            if (need > pcap)
+            {
+               free(pbuf); free(pbuf2);
+               pbuf = malloc(need); pbuf2 = malloc(need); pcap = need;
+               have_prev = 0;
+            }
+            if (have_prev && !unser(pbuf, pcap))
+               fprintf(stderr, "[vkhost] run-ahead unser FAILED frame %d\n", i);
+            ra_hidden = 1;
+            lt_phase  = RETRO_EXECUTION_PHASE_RETAINED;
+            retro_run_fn();   /* the kept frame */
+            if (!pbuf || !ser(pbuf, need))
+               fprintf(stderr, "[vkhost] run-ahead ser FAILED frame %d\n", i);
+            have_prev = 1;
+            lt_phase  = RETRO_EXECUTION_PHASE_SPECULATIVE;
+            for (k = 1; k < ra_frames; k++)
+               retro_run_fn();
+            ra_hidden = 0;   /* the frame run below is shown */
          }
          if (reload && ser && unser && ssz)
          {
@@ -1490,6 +1656,7 @@ run_frames_sw:
             clock_gettime(CLOCK_MONOTONIC, &f0);
             retro_run_fn();
             clock_gettime(CLOCK_MONOTONIC, &f1);
+            lt_phase = RETRO_EXECUTION_PHASE_RETAINED;
             ms = (f1.tv_sec - f0.tv_sec) * 1e3 + (f1.tv_nsec - f0.tv_nsec) / 1e6;
             if (frames_started && ms > longest_frame_ms)
             {
@@ -1567,6 +1734,7 @@ run_frames_sw:
    up_ready = 0;
    up_readback_free();
    context_live = 0;
+   lt_release_all();
    if (hw_render.context_destroy && vkctx.device) hw_render.context_destroy();
    if (queue_thread_run)
    {
@@ -1621,6 +1789,11 @@ run_frames_sw:
         fclose(f);
      }
    }
+   if (ra_frames > 0)
+      fprintf(stderr, "[vkhost] run-ahead: %ld frames drawn with video off\n", ra_hidden_drawn);
+   if (lt_on)
+      fprintf(stderr, "[vkhost] lifetime: %ld managed saves, %ld releases, %ld refused loads\n",
+            lt_saves, lt_releases, lt_refused);
    { void (*f)(void) = dlsym(core, "retro_unload_game"); if (f) f(); }
    { void (*f)(void) = dlsym(core, "retro_deinit"); if (f) f(); }
    if (next_content && !(validation_errors || queue_violations || queue_waits_locked))

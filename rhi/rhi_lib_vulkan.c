@@ -5686,8 +5686,6 @@ static void renderer_set_interpolant_attribs(CommandBuffer *cmd)
       TextureWindow texture_window;
       TTRect cached_window_rect;
       TTRect draw_rect;
-      int draw_offset_x;
-      int draw_offset_y;
       unsigned palette_offset_x;
       unsigned palette_offset_y;
       unsigned texture_offset_x;
@@ -5751,8 +5749,6 @@ static void render_state_init(struct RenderState *s)
    s->texture_window.or_x = 0; s->texture_window.or_y = 0;
    rect_zero(&s->cached_window_rect);
    rect_zero(&s->draw_rect);
-   s->draw_offset_x = 0;
-   s->draw_offset_y = 0;
    s->palette_offset_x = 0;
    s->palette_offset_y = 0;
    s->texture_offset_x = 0;
@@ -5965,6 +5961,10 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
    typedef struct SaveState SaveState;
    enum { RENDERER_UPLOAD_RINGS = 8 };
    enum { RENDERER_IMAGE_CACHE = 32 };
+   /* At most this many snapshots, and no more than the budget's worth of
+    * GPU memory: the frontend keeps up to 16 managed states. */
+   enum { RENDERER_SNAPSHOTS = 16 };
+#define RENDERER_SNAPSHOT_BUDGET ((VkDeviceSize)1 << 30)
    struct Renderer
    {
          /* batch-7 out-of-line methods -> free functions. */
@@ -6227,6 +6227,23 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
           * and the frontend's per-sync-index handle is dropped once that
           * index comes round again. Sized for two frames of intermediates. */
          ImageHandle image_cache[RENDERER_IMAGE_CACHE];
+         /* Snapshots of VRAM as the renderer holds it - both domains at
+          * their own resolution and which one owns each block - for the
+          * frontend's managed savestates (RETRO_ENVIRONMENT_SET_SAVESTATE_
+          * LIFETIME). A slot's images are made the first time it is used
+          * and kept until the renderer goes. */
+         struct VramSnapshot
+         {
+            ImageHandle framebuffer;
+            ImageHandle scaled;
+            ImageHandle scaled_msaa;
+            StatusFlags fb_info[NUM_BLOCKS_X * NUM_BLOCKS_Y];
+            uint32_t prov[VRAM_PROV_WORDS];
+            uint32_t gen;
+            bool made;
+            bool live;
+         } snapshots[RENDERER_SNAPSHOTS];
+         unsigned snapshot_slots;
    };
 
    /* SaveState lifecycle free functions (SaveState is a plain struct). vram is
@@ -6488,10 +6505,10 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
    }
    static INLINE void renderer_notify_texture_upload(Renderer *self,
          TTRect rect,
-         uint16_t *vram)
+         const uint16_t *src, uint32_t stride)
    {
       if (self->texture_tracking_enabled)
-         texture_tracker_upload(self->tracker, rect, vram);
+         texture_tracker_upload(self->tracker, rect, src, stride);
    }
    static INLINE void renderer_set_vram_framebuffer_coords(Renderer *self,
          unsigned xstart,
@@ -7217,6 +7234,161 @@ static void renderer_save_vram_state(Renderer *self, SaveState *out){
     * (renderer-rebuild) change. */
    fence_reset(&fence);
    bh_reset(&buffer);
+}
+
+/* ---- Managed savestate snapshots ------------------------------------------
+ * A snapshot is VRAM as the renderer holds it: the native framebuffer, the
+ * scaled one (and its multisampled image) at their own resolution, which of
+ * them owns each block, and which blocks the GPU wrote. Taken and put back
+ * by GPU copies alone; nothing is read back. */
+
+#define SNAPSHOT_HAZARDS (STATUS_FB_READ | STATUS_FB_WRITE \
+      | STATUS_SFB_READ | STATUS_SFB_WRITE)
+
+/* Across renderers, so a token from a renderer since rebuilt never matches */
+static uint32_t snapshot_gen_last;
+
+static VkDeviceSize renderer_snapshot_bytes(Renderer *self)
+{
+   const ImageCreateInfo *sc = image_get_create_info(ih_get(&self->scaled_framebuffer));
+   VkDeviceSize px  = (VkDeviceSize)sc->width * sc->height;
+   VkDeviceSize bpp = sc->format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+   VkDeviceSize n   = px * bpp + (VkDeviceSize)FB_WIDTH * FB_HEIGHT * 4;
+   if (self->msaa > 1)
+      n += px * bpp * self->msaa;
+   return n;
+}
+
+static ImageHandle renderer_snapshot_image(Renderer *self, const Image *like)
+{
+   ImageCreateInfo info = *image_get_create_info(like);
+   ImageHandle     h;
+   info.levels         = 1;
+   info.misc           = 0;
+   info.usage          = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   info.initial_layout = VK_IMAGE_LAYOUT_GENERAL;
+   h = device_create_image(self->device, &info, NULL);
+   if (h.data)
+      image_set_layout(ih_get(&h), Layout_General);
+   return h;
+}
+
+static bool renderer_snapshot_make(Renderer *self, struct VramSnapshot *sn)
+{
+   ih_move(&sn->framebuffer, renderer_snapshot_image(self, ih_get(&self->framebuffer)));
+   ih_move(&sn->scaled, renderer_snapshot_image(self, ih_get(&self->scaled_framebuffer)));
+   if (self->msaa > 1)
+      ih_move(&sn->scaled_msaa, renderer_snapshot_image(self, ih_get(&self->scaled_framebuffer_msaa)));
+   if (!sn->framebuffer.data || !sn->scaled.data
+         || (self->msaa > 1 && !sn->scaled_msaa.data))
+   {
+      ih_reset(&sn->framebuffer);
+      ih_reset(&sn->scaled);
+      ih_reset(&sn->scaled_msaa);
+      return false;
+   }
+   sn->made = true;
+   return true;
+}
+
+static void renderer_snapshot_copy(Renderer *self, const Image *dst, const Image *src)
+{
+   const ImageCreateInfo *i = image_get_create_info(src);
+   VkOffset3D o = { 0, 0, 0 };
+   VkExtent3D e;
+   e.width  = i->width;
+   e.height = i->height;
+   e.depth  = 1;
+   commandbuffer_copy_image(cbh_get(&self->cmd), dst, src, &o, &o, &e);
+}
+
+/* The slot taken, or -1 when none is free and the budget allows no other:
+ * the state is then an ordinary one. HD texture tracking keeps state of
+ * its own that a snapshot does not carry. */
+static int renderer_snapshot_save(Renderer *self, uint32_t *gen)
+{
+   struct VramSnapshot *sn;
+   unsigned i;
+   int      slot = -1;
+
+   if (self->texture_tracking_enabled)
+      return -1;
+   for (i = 0; i < self->snapshot_slots; i++)
+      if (!self->snapshots[i].live)
+      {
+         slot = (int)i;
+         break;
+      }
+   if (slot < 0)
+   {
+      if (self->snapshot_slots >= RENDERER_SNAPSHOTS
+            || (self->snapshot_slots + 1) * renderer_snapshot_bytes(self)
+               > RENDERER_SNAPSHOT_BUDGET
+            || !renderer_snapshot_make(self, &self->snapshots[self->snapshot_slots]))
+         return -1;
+      slot = (int)self->snapshot_slots++;
+   }
+   sn = &self->snapshots[slot];
+
+   /* Everything queued on either domain lands before the copies read it */
+   fbatlas_pipeline_barrier(&self->atlas, SNAPSHOT_HAZARDS);
+   renderer_ensure_command_buffer(self);
+   renderer_snapshot_copy(self, ih_get(&sn->framebuffer), ih_get(&self->framebuffer));
+   renderer_snapshot_copy(self, ih_get(&sn->scaled), ih_get(&self->scaled_framebuffer));
+   if (self->msaa > 1)
+      renderer_snapshot_copy(self, ih_get(&sn->scaled_msaa), ih_get(&self->scaled_framebuffer_msaa));
+   memcpy(sn->fb_info, self->atlas.fb_info, sizeof(sn->fb_info));
+   memcpy(sn->prov, self->vram_gpu_written, sizeof(sn->prov));
+   /* The copies read both domains everywhere: a later write waits for them */
+   for (i = 0; i < NUM_BLOCKS_X * NUM_BLOCKS_Y; i++)
+      self->atlas.fb_info[i] |= STATUS_TRANSFER_FB_READ | STATUS_TRANSFER_SFB_READ;
+
+   if (++snapshot_gen_last == 0)
+      ++snapshot_gen_last;
+   sn->gen  = snapshot_gen_last;
+   sn->live = true;
+   *gen     = sn->gen;
+   return slot;
+}
+
+static struct VramSnapshot *renderer_snapshot_find(Renderer *self,
+      uint32_t slot, uint32_t gen)
+{
+   struct VramSnapshot *sn;
+   if (slot >= self->snapshot_slots)
+      return NULL;
+   sn = &self->snapshots[slot];
+   return (sn->live && sn->gen == gen) ? sn : NULL;
+}
+
+static bool renderer_snapshot_restore(Renderer *self, uint32_t slot, uint32_t gen)
+{
+   struct VramSnapshot *sn = renderer_snapshot_find(self, slot, gen);
+   unsigned i;
+   if (!sn)
+      return false;
+
+   /* Everything queued reads and writes VRAM as it was; then it is replaced */
+   fbatlas_pipeline_barrier(&self->atlas, SNAPSHOT_HAZARDS);
+   renderer_ensure_command_buffer(self);
+   renderer_snapshot_copy(self, ih_get(&self->framebuffer), ih_get(&sn->framebuffer));
+   renderer_snapshot_copy(self, ih_get(&self->scaled_framebuffer), ih_get(&sn->scaled));
+   if (self->msaa > 1)
+      renderer_snapshot_copy(self, ih_get(&self->scaled_framebuffer_msaa), ih_get(&sn->scaled_msaa));
+   /* The copies wrote both domains everywhere: a later access waits for them */
+   for (i = 0; i < NUM_BLOCKS_X * NUM_BLOCKS_Y; i++)
+      self->atlas.fb_info[i] = sn->fb_info[i]
+            | STATUS_TRANSFER_FB_WRITE | STATUS_TRANSFER_SFB_WRITE;
+   memcpy(self->vram_gpu_written, sn->prov, sizeof(sn->prov));
+   fbatlas_invalidate_palette_cache(&self->atlas);
+   return true;
+}
+
+static void renderer_snapshot_release(Renderer *self, uint32_t slot, uint32_t gen)
+{
+   struct VramSnapshot *sn = renderer_snapshot_find(self, slot, gen);
+   if (sn)
+      sn->live = false;
 }
 
 static void renderer_init_primitive_pipelines(Renderer *self)
@@ -9945,8 +10117,8 @@ static void renderer_build_attribs(Renderer *self, BufferVertex *output, const V
    unsigned min_u = FB_WIDTH;
    unsigned min_v = FB_HEIGHT;
    { unsigned i; for (i = 0; i < count; i++) {
-      float tmp_x = vertices[i].x + self->render_state.draw_offset_x + self->upscaler_jitter_x;
-      float tmp_y = vertices[i].y + self->render_state.draw_offset_y + self->upscaler_jitter_y;
+      float tmp_x = vertices[i].x + self->upscaler_jitter_x;
+      float tmp_y = vertices[i].y + self->upscaler_jitter_y;
       max_x = max_(max_x, tmp_x);
       max_y = max_(max_y, tmp_y);
       min_x = min_(min_x, tmp_x);
@@ -10309,8 +10481,8 @@ static bool renderer_native_line_endpoints(const Renderer *self,
       return false;
    for (i = 0; i < 2; i++)
    {
-      float px = vertices[i].x + self->render_state.draw_offset_x;
-      float py = vertices[i].y + self->render_state.draw_offset_y;
+      float px = vertices[i].x;
+      float py = vertices[i].y;
       if (vertices[i].w != 1.0f ||
           !(px >= -32768.0f && px <= 32767.0f) ||
           !(py >= -32768.0f && py <= 32767.0f))
@@ -10492,8 +10664,8 @@ static void renderer_upscaler_keep(Renderer *self, const Vertex *vertices, unsig
       return;
    for (i = 0; i < count; i++)
    {
-      points[i].x = vertices[i].x + self->render_state.draw_offset_x;
-      points[i].y = vertices[i].y + self->render_state.draw_offset_y;
+      points[i].x = vertices[i].x;
+      points[i].y = vertices[i].y;
       points[i].w = vertices[i].w;
       if (vertices[i].color != vertices[0].color)
          flat = false;
@@ -12131,6 +12303,12 @@ static void renderer_fini(Renderer *self)
    ih_reset(&self->framebuffer);
    ih_reset(&self->framebuffer_ssaa);
    ih_reset(&self->palette_cache);
+   { unsigned _si; for (_si = 0; _si < RENDERER_SNAPSHOTS; _si++)
+   {
+      ih_reset(&self->snapshots[_si].framebuffer);
+      ih_reset(&self->snapshots[_si].scaled);
+      ih_reset(&self->snapshots[_si].scaled_msaa);
+   } }
    ih_reset(&self->last_scanout);
    ih_reset(&self->reuseable_scanout);
    /* Analog path intermediates. These are recreated every frame, so ih_move
@@ -22628,10 +22806,6 @@ static void vk_defer_dispatch(void *user, const rhi_defer_op_t *op)
                                    op->u.set_tex_window.twx,
                                    op->u.set_tex_window.twy);
          break;
-      case RHI_DEFER_SET_DRAW_OFFSET:
-         rhi_vulkan_set_draw_offset(op->u.set_draw_offset.x,
-                                    op->u.set_draw_offset.y);
-         break;
       case RHI_DEFER_SET_DRAW_AREA:
          rhi_vulkan_set_draw_area(op->u.set_draw_area.x0,
                                   op->u.set_draw_area.y0,
@@ -22664,7 +22838,7 @@ static void vk_defer_dispatch(void *user, const rhi_defer_op_t *op)
                                op->u.load_image.y,
                                op->u.load_image.w,
                                op->u.load_image.h,
-                               op->u.load_image.vram,
+                               op->u.load_image.vram, 0,
                                op->u.load_image.mask_test,
                                op->u.load_image.set_mask);
          break;
@@ -22678,6 +22852,8 @@ static void vk_context_reset(void)
 {
    /* A new context: the frontend has no frame of ours to repeat */
    vk_dupe_ready = false;
+   /* Uploads deferred until now read VRAM */
+   GPU_ThreadSettle();
 
    if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, (void**)&vulkan) || !vulkan)
       return;
@@ -23786,14 +23962,14 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
     * has. Not where the picture moves on its own (interlaced fields, the
     * cable chain's subcarrier, the VRAM viewer), and only once a frame
     * has been presented. Visual core option changes wait for the next
-    * frame drawn. */
-   if (     psx_frame_duping
+    * frame drawn. A frame the frontend throws away is not drawn either. */
+   if (psx_frame_hidden || (psx_frame_duping
          && vk_dupe_ready
          && !GPU_get_display_change_count()
          && !GPU_get_display_possibly_dirty()
          && !renderer->render_state.is_480i
          && !show_vram
-         && psx_video_cable == RHI_CABLE_NONE)
+         && psx_video_cable == RHI_CABLE_NONE))
    {
       renderer_flush(renderer);
       video_refresh_cb(NULL, prev_frame_width, prev_frame_height, 0);
@@ -23970,17 +24146,6 @@ void rhi_vulkan_set_tex_window(uint8_t tww, uint8_t twh,
       }
    else
       rhi_defer_push_set_tex_window(&defer, tww, twh, twx, twy);
-}
-
-void rhi_vulkan_set_draw_offset(int16_t x, int16_t y)
-{
-   if (renderer)
-   {
-      renderer->render_state.draw_offset_x = x;
-      renderer->render_state.draw_offset_y = y;
-   }
-   else
-      rhi_defer_push_set_draw_offset(&defer, x, y);
 }
 
 void rhi_vulkan_set_draw_area(uint16_t x0, uint16_t y0,
@@ -24257,22 +24422,23 @@ void rhi_vulkan_push_line(
 void rhi_vulkan_load_image(
       uint16_t x, uint16_t y,
       uint16_t w, uint16_t h,
-      uint16_t *vram,
+      const uint16_t *src, uint32_t stride,
       bool mask_test, bool set_mask)
 {
    if (!renderer)
    {
       /* Pre-context_reset uploads (e.g. savestate-load arriving before
        * the Vulkan context is up, or game boot pushing VRAM ahead of
-       * the frontend's context_reset). The captured `vram` pointer
-       * aliases GPU.vram, which lives for the whole core lifetime, so
-       * holding it across the deferred-replay window is safe. */
-      rhi_defer_push_load_image(&defer, x, y, w, h, vram, mask_test, set_mask);
+       * the frontend's context_reset). The replay reads GPU.vram, which
+       * lives for the whole core lifetime and by then holds the upload,
+       * so even a source lent for this call alone is not kept. */
+      rhi_defer_push_load_image(&defer, x, y, w, h,
+            stride ? GPU_get_vram() : src, mask_test, set_mask);
       return;
    }
 
    { TTRect _ntu_rect; _ntu_rect.x = x; _ntu_rect.y = y; _ntu_rect.width = w; _ntu_rect.height = h;
-     renderer_notify_texture_upload(renderer, _ntu_rect, vram); }
+     renderer_notify_texture_upload(renderer, _ntu_rect, src, stride); }
    renderer->render_state.mask_test      = mask_test;
    renderer->render_state.force_mask_bit = set_mask;
    {
@@ -24280,7 +24446,7 @@ void rhi_vulkan_load_image(
       BufferHandle  handle;
       const Buffer *mapped = NULL;
       uint16_t     *tmp;
-      bool          dual_copy, y_wrap;
+      unsigned      first, off_y;
       handle.data = NULL;
       tmp = renderer_copy_cpu_to_vram(renderer, &_r, &handle, &mapped);
       if (!tmp)
@@ -24289,62 +24455,21 @@ void rhi_vulkan_load_image(
          return;
       }
 
-      /* The row loop has two independent invariants: x-wrap (dual_copy)
-       * and y-wrap. Both are determined entirely by (x, y, w, h) before
-       * the loop runs. Hoisting them out lets the inner loops degenerate
-       * to a single straight memcpy in the common no-wrap case and lets
-       * the compiler/CPU prefetcher see the full source-pointer stride.
-       *
-       * The (y + off_y) & (FB_HEIGHT - 1) mask in the original code was
-       * a no-op for every iteration when y + h <= FB_HEIGHT (the dominant
-       * case for upload rects), but the compiler can't prove that without
-       * splitting the loop.
-       */
-      dual_copy = x + w > FB_WIDTH;
-      y_wrap    = y + h > FB_HEIGHT;
-
-      if (dual_copy)
-      {
-         unsigned off_y;
-         const unsigned first  = FB_WIDTH - x;
-         const unsigned second = w - first;
-         if (y_wrap)
-         {
-            for (off_y = 0; off_y < h; off_y++)
-            {
-               const uint16_t *row = vram + ((y + off_y) & (FB_HEIGHT - 1)) * FB_WIDTH;
-               memcpy(tmp + off_y * w,         row + x, first  * sizeof(uint16_t));
-               memcpy(tmp + off_y * w + first, row,     second * sizeof(uint16_t));
-            }
-         }
-         else
-         {
-            for (off_y = 0; off_y < h; off_y++)
-            {
-               const uint16_t *row = vram + (y + off_y) * FB_WIDTH;
-               memcpy(tmp + off_y * w,         row + x, first  * sizeof(uint16_t));
-               memcpy(tmp + off_y * w + first, row,     second * sizeof(uint16_t));
-            }
-         }
-      }
+      /* Into the staging ring row by row: a source holding just the rect
+       * with its own width as the pitch goes in one copy; VRAM rows wrap
+       * at 1024 and at 512 lines. */
+      first = RHI_SRC_FIRST(stride, x, w);
+      if (stride == w)
+         memcpy(tmp, src, (size_t)w * h * sizeof(uint16_t));
       else
-      {
-         unsigned off_y;
-         if (y_wrap)
+         for (off_y = 0; off_y < h; off_y++)
          {
-            for (off_y = 0; off_y < h; off_y++)
-               memcpy(tmp + off_y * w,
-                     vram + ((y + off_y) & (FB_HEIGHT - 1)) * FB_WIDTH + x,
-                     w * sizeof(uint16_t));
+            memcpy(tmp + off_y * w, RHI_SRC_ROW(src, stride, x, y, off_y),
+                  first * sizeof(uint16_t));
+            if (first < w)
+               memcpy(tmp + off_y * w + first, RHI_SRC_WRAP(src, y, off_y),
+                     (w - first) * sizeof(uint16_t));
          }
-         else
-         {
-            for (off_y = 0; off_y < h; off_y++)
-               memcpy(tmp + off_y * w,
-                     vram + (y + off_y) * FB_WIDTH + x,
-                     w * sizeof(uint16_t));
-         }
-      }
       /* Only this rect's bytes of the ring go out. */
       device_flush_host_buffer(renderer->device, mapped,
             (VkDeviceSize)((const uint8_t *)tmp - (const uint8_t *)buffer_get_allocation(mapped)->host_base),
@@ -24355,19 +24480,6 @@ void rhi_vulkan_load_image(
        * rect; the recorded copy keeps its own reference. */
       bh_reset(&handle);
    }
-}
-
-bool rhi_vulkan_read_vram(uint16_t x, uint16_t y,
-                          uint16_t w, uint16_t h,
-                          uint16_t *vram)
-{
-   if (!renderer)
-      return false;
-   {
-      TTRect _r = { x, y, w, h };
-      renderer_copy_vram_to_cpu_synchronous(renderer, &_r, vram);
-   }
-   return true;
 }
 
 bool rhi_vulkan_read_vram_rects(const uint16_t (*rects)[4], unsigned count,
@@ -24440,4 +24552,32 @@ bool rhi_vulkan_has_software_renderer(void)
 bool rhi_vulkan_context_ready(void)
 {
    return device != NULL && renderer != NULL;
+}
+
+bool rhi_vulkan_snapshot_save(uint32_t *slot, uint32_t *gen)
+{
+   int s;
+   if (!device || !renderer)
+      return false;
+   s = renderer_snapshot_save(renderer, gen);
+   if (s < 0)
+      return false;
+   *slot = (uint32_t)s;
+   return true;
+}
+
+bool rhi_vulkan_snapshot_valid(uint32_t slot, uint32_t gen)
+{
+   return device && renderer && renderer_snapshot_find(renderer, slot, gen);
+}
+
+bool rhi_vulkan_snapshot_restore(uint32_t slot, uint32_t gen)
+{
+   return device && renderer && renderer_snapshot_restore(renderer, slot, gen);
+}
+
+void rhi_vulkan_snapshot_release(uint32_t slot, uint32_t gen)
+{
+   if (device && renderer)
+      renderer_snapshot_release(renderer, slot, gen);
 }

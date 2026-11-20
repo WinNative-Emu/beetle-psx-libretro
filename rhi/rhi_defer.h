@@ -53,7 +53,6 @@ extern "C" {
 typedef enum
 {
    RHI_DEFER_SET_TEX_WINDOW = 0,
-   RHI_DEFER_SET_DRAW_OFFSET,
    RHI_DEFER_SET_DRAW_AREA,
    RHI_DEFER_SET_VRAM_FRAMEBUFFER_COORDS,
    RHI_DEFER_SET_HORIZONTAL_DISPLAY_RANGE,
@@ -95,12 +94,6 @@ typedef struct
 
       struct
       {
-         int16_t x;
-         int16_t y;
-      } set_draw_offset;
-
-      struct
-      {
          uint16_t x0;
          uint16_t y0;
          uint16_t x1;
@@ -139,7 +132,8 @@ typedef struct
          uint16_t  y;
          uint16_t  w;
          uint16_t  h;
-         uint16_t *vram;
+         /* VRAM, read when the upload is replayed */
+         const uint16_t *vram;
          bool      mask_test;
          bool      set_mask;
       } load_image;
@@ -202,9 +196,6 @@ void rhi_defer_push_set_tex_window(rhi_defer_queue_t *q,
                                    uint8_t tww, uint8_t twh,
                                    uint8_t twx, uint8_t twy);
 
-void rhi_defer_push_set_draw_offset(rhi_defer_queue_t *q,
-                                    int16_t x, int16_t y);
-
 void rhi_defer_push_set_draw_area(rhi_defer_queue_t *q,
                                   uint16_t x0, uint16_t y0,
                                   uint16_t x1, uint16_t y1);
@@ -228,7 +219,7 @@ void rhi_defer_push_set_display_mode(rhi_defer_queue_t *q,
 void rhi_defer_push_load_image(rhi_defer_queue_t *q,
                                uint16_t x, uint16_t y,
                                uint16_t w, uint16_t h,
-                               uint16_t *vram,
+                               const uint16_t *vram,
                                bool mask_test, bool set_mask);
 
 void rhi_defer_push_toggle_display(rhi_defer_queue_t *q, bool status);

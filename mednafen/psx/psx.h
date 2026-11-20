@@ -24,7 +24,6 @@ void MDFN_FASTCALL PSX_MemWrite24(int32_t timestamp, uint32_t A, uint32_t V);
 void MDFN_FASTCALL PSX_MemWrite32(int32_t timestamp, uint32_t A, uint32_t V);
 
 uint8_t  PSX_MemPeek8 (uint32_t A);
-uint16_t PSX_MemPeek16(uint32_t A);
 uint32_t PSX_MemPeek32(uint32_t A);
 
 /* Should write to WO-locations if possible */
@@ -85,6 +84,7 @@ void FrontIO_GPULineHook(struct FrontIO *fio,
                          const unsigned pix_clock_divider,
                          const unsigned surf_pitchinpix,
                          const unsigned upscale_factor);
+bool FrontIO_LineNeedsPixels(const struct FrontIO *fio, bool vsync);
 
 uint8_t PSX_MemPeek8(uint32_t A);
 void    PSX_MemPoke8(uint32_t A, uint8_t V);

@@ -68,11 +68,9 @@ void rhi_intf_finalize_frame(const void *fb, unsigned width,
 void rhi_intf_set_tex_window(uint8_t tww, uint8_t twh,
                              uint8_t twx, uint8_t twy);
 
-void rhi_intf_set_mask_setting(uint32_t mask_set_or, uint32_t mask_eval_and);
 /* GP0(01) clear cache and reset: the hardware renderers drop any retained
  * CLUT so the next 4/8bpp draw fetches its palette from VRAM again. */
 void rhi_intf_invalidate_clut_cache(void);
-void rhi_intf_set_draw_offset(int16_t x, int16_t y);
 void rhi_intf_set_draw_area(uint16_t x0, uint16_t y0,
                             uint16_t x1, uint16_t y1);
 void rhi_intf_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart);
@@ -154,11 +152,18 @@ void rhi_intf_push_line(int16_t p0x, int16_t p0y,
                         bool mask_test,
                         bool set_mask);
 
+/* A CPU-to-VRAM upload of the rectangle (x, y, w, h).  Its pixels come
+ * from src: with stride 0, src is VRAM and the rectangle is read at its
+ * own coordinates, wrapping at 1024x512 as VRAM does; otherwise src holds
+ * only the rectangle, row after row, stride pixels apart, and is valid for
+ * the call alone, so a renderer that keeps it for later copies it. */
 void rhi_intf_load_image(uint16_t x, uint16_t y,
                          uint16_t w, uint16_t h,
-                         uint16_t *vram,
+                         const uint16_t *src, uint32_t stride,
                          bool mask_test,
                          bool set_mask);
+
+/* RHI_SRC_ROW and its neighbours (rhi_tt.h) read such a source. */
 
 bool rhi_intf_read_vram(uint16_t x, uint16_t y,
                         uint16_t w, uint16_t h,
@@ -180,6 +185,10 @@ void rhi_intf_toggle_display(bool status);
 bool rhi_intf_has_software_renderer(void);
 bool rhi_intf_context_ready(void);
 uint32_t rhi_intf_vram_dirty_groups(unsigned br);
+bool rhi_intf_snapshot_save(uint32_t *slot, uint32_t *gen);
+bool rhi_intf_snapshot_valid(uint32_t slot, uint32_t gen);
+bool rhi_intf_snapshot_restore(uint32_t slot, uint32_t gen);
+void rhi_intf_snapshot_release(uint32_t slot, uint32_t gen);
 
 double rhi_common_get_timing_fps(void);
 

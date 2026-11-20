@@ -457,20 +457,6 @@ void rhi_intf_set_tex_window(uint8_t tww, uint8_t twh,
    }
 }
 
-void rhi_intf_set_mask_setting(uint32_t mask_set_or, uint32_t mask_eval_and)
-{
-   switch (rhi_type)
-   {
-      case RHI_SOFTWARE:
-         break;
-      case RHI_OPENGL:
-         break;
-      case RHI_VULKAN:
-         /* TODO/FIXME */
-         break;
-   }
-}
-
 void rhi_intf_invalidate_clut_cache(void)
 {
    switch (rhi_type)
@@ -486,29 +472,6 @@ void rhi_intf_invalidate_clut_cache(void)
 #endif
          break;
       default:
-         break;
-   }
-}
-
-void rhi_intf_set_draw_offset(int16_t x, int16_t y)
-{
-#ifdef RHI_DUMP
-   rhi_dump_set_draw_offset(x, y);
-#endif
-
-   switch (rhi_type)
-   {
-      case RHI_SOFTWARE:
-         break;
-      case RHI_OPENGL:
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
-         rhi_gl_set_draw_offset(x, y);
-#endif
-         break;
-      case RHI_VULKAN:
-#if defined(HAVE_VULKAN)
-         rhi_vulkan_set_draw_offset(x, y);
-#endif
          break;
    }
 }
@@ -996,10 +959,10 @@ static bool rhi_intf_read_rects(const tt_coh_rect *r, unsigned n, uint16_t *vram
 
 void rhi_intf_load_image(uint16_t x, uint16_t y,
       uint16_t w, uint16_t h,
-      uint16_t *vram, bool mask_test, bool set_mask)
+      const uint16_t *src, uint32_t stride, bool mask_test, bool set_mask)
 {
 #ifdef RHI_DUMP
-   rhi_dump_load_image(x, y, w, h, vram, mask_test, set_mask);
+   rhi_dump_load_image(x, y, w, h, src, stride, mask_test, set_mask);
 #endif
 #ifdef DEBUG
    tt_log("load_image rect=(%u,%u %ux%u) mask_test=%d set_mask=%d\n",
@@ -1026,12 +989,12 @@ void rhi_intf_load_image(uint16_t x, uint16_t y,
          break;
       case RHI_OPENGL:
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
-         rhi_gl_load_image(x, y, w, h, vram, mask_test, set_mask);
+         rhi_gl_load_image(x, y, w, h, src, stride, mask_test, set_mask);
 #endif
          break;
       case RHI_VULKAN:
 #if defined(HAVE_VULKAN)
-         rhi_vulkan_load_image(x, y, w, h, vram, mask_test, set_mask);
+         rhi_vulkan_load_image(x, y, w, h, src, stride, mask_test, set_mask);
 #endif
          break;
    }
@@ -1158,6 +1121,47 @@ bool rhi_intf_context_ready(void)
 uint32_t rhi_intf_vram_dirty_groups(unsigned br)
 {
    return tt_coh_dirty_groups(br);
+}
+
+/* Snapshots of VRAM as the hardware renderer holds it, for managed
+ * savestates. Only the Vulkan renderer takes them. */
+bool rhi_intf_snapshot_save(uint32_t *slot, uint32_t *gen)
+{
+#if defined(HAVE_VULKAN)
+   if (rhi_type == RHI_VULKAN)
+      return rhi_vulkan_snapshot_save(slot, gen);
+#endif
+   return false;
+}
+
+bool rhi_intf_snapshot_valid(uint32_t slot, uint32_t gen)
+{
+#if defined(HAVE_VULKAN)
+   if (rhi_type == RHI_VULKAN)
+      return rhi_vulkan_snapshot_valid(slot, gen);
+#endif
+   return false;
+}
+
+bool rhi_intf_snapshot_restore(uint32_t slot, uint32_t gen)
+{
+#if defined(HAVE_VULKAN)
+   if (rhi_type == RHI_VULKAN && rhi_vulkan_snapshot_restore(slot, gen))
+   {
+      /* What the GPU holds is no longer what the CPU copy was compared with */
+      tt_coh_reset();
+      return true;
+   }
+#endif
+   return false;
+}
+
+void rhi_intf_snapshot_release(uint32_t slot, uint32_t gen)
+{
+#if defined(HAVE_VULKAN)
+   if (rhi_type == RHI_VULKAN)
+      rhi_vulkan_snapshot_release(slot, gen);
+#endif
 }
 
 void rhi_intf_toggle_display(bool status)

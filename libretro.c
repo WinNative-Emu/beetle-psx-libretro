@@ -94,6 +94,9 @@ uint8_t widescreen_hack_aspect_ratio_setting;
 uint8_t psx_gpu_upscale_shift;
 uint8_t psx_gpu_upscale_shift_hw;
 bool psx_gpu_rasterize_both_fields = false;
+/* Software drawing on the GPU thread, when the CPU has the cores for it:
+ * GPU_ThreadSelect's lanes */
+static int psx_gpu_thread = -1;
 bool psx_gpu_bob_scanout = false;
 int line_render_mode;
 int filter_mode;
@@ -131,6 +134,7 @@ static unsigned internal_frame_count = 0;
 static bool display_internal_framerate = false;
 static bool display_notifications = true;
 bool psx_frame_duping = false;
+bool psx_frame_hidden = false;
 static unsigned image_offset = 0;
 static unsigned image_crop = 0;
 static bool enable_memcard1 = false;
@@ -1312,27 +1316,6 @@ MultiAccessSizeMem *PIOMem = NULL;
 MultiAccessSizeMem *MainRAM = NULL;
 MultiAccessSizeMem *ScratchRAM = NULL;
 
-/*
- * C-linkage accessors for MainRAM declared in mednafen/psx/psx_mem.h.
- * MainRAM itself is a MultiAccessSizeMem<> template instance and so
- * isn't reachable from a C TU; these forwarders let C consumers
- * (dma.c, ...) access the same byte-level read/write helpers
- * without going through psx.h's class declarations.
- *
- * Inline away to a single load/store under -O2 / LTO.
- */
-uint8_t  ScratchRAM_ReadU8 (uint32_t address) { return MASMEM_ReadU8(ScratchRAM, address); }
-uint16_t ScratchRAM_ReadU16(uint32_t address) { return MASMEM_ReadU16(ScratchRAM, address); }
-uint32_t ScratchRAM_ReadU24(uint32_t address) { return MASMEM_ReadU24(ScratchRAM, address); }
-uint32_t ScratchRAM_ReadU32(uint32_t address) { return MASMEM_ReadU32(ScratchRAM, address); }
-void     ScratchRAM_WriteU8 (uint32_t address, uint8_t  value) { MASMEM_WriteU8(ScratchRAM, address, value); }
-void     ScratchRAM_WriteU16(uint32_t address, uint16_t value) { MASMEM_WriteU16(ScratchRAM, address, value); }
-void     ScratchRAM_WriteU24(uint32_t address, uint32_t value) { MASMEM_WriteU24(ScratchRAM, address, value); }
-void     ScratchRAM_WriteU32(uint32_t address, uint32_t value) { MASMEM_WriteU32(ScratchRAM, address, value); }
-uint8_t *ScratchRAM_data8(void) { return ScratchRAM->data8; }
-uint8_t *MainRAM_data8   (void) { return MainRAM->data8;    }
-uint8_t *BIOSROM_data8   (void) { return BIOSROM->data8;    }
-
 #ifdef HAVE_LIGHTREC
 /* Size of Expansion 1 (8MB) */
 #define PSX_EXPANSION1_SIZE        0x800000U
@@ -1474,11 +1457,6 @@ static INLINE int32_t FirstRealEventTS(void)
       e = e->next;
 
    return e->event_time;
-}
-
-int32_t PSX_EventTS(const int type)
-{
-   return events[type].event_time;
 }
 
 bool PSX_AnyEventVirtual(void)
@@ -2133,11 +2111,6 @@ static INLINE uint32_t MemPeek(int32_t timestamp, uint32_t A, unsigned size, boo
 uint8_t PSX_MemPeek8(uint32_t A)
 {
    return MemPeek(0, A, 1, false);
-}
-
-uint16_t PSX_MemPeek16(uint32_t A)
-{
-   return MemPeek(0, A, 2, false);
 }
 
 uint32_t PSX_MemPeek32(uint32_t A)
@@ -4551,6 +4524,88 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
    va_end(va);
 }
 
+/* Managed savestates (RETRO_ENVIRONMENT_SET_SAVESTATE_LIFETIME): a state
+ * the frontend keeps in this instance for Run-Ahead or Preemptive Frames
+ * ends in a token naming a snapshot of VRAM as the hardware renderer held
+ * it, so a load puts the renderer back as it was - at its internal
+ * resolution - instead of uploading the state's 1x VRAM. The state before
+ * the token is an ordinary one: without its snapshot it loads as any other. */
+#define STATE_TOKEN_MAGIC 0x4d535042u /* "BPSM" */
+#define STATE_TOKEN_SIZE  16
+
+static bool state_lifetime;
+
+/* A load by the frontend's own rollback (Run-Ahead, Preemptive Frames)
+ * brings back what this instance already had */
+static bool state_same_instance(void)
+{
+   int context = RETRO_SAVESTATE_CONTEXT_NORMAL;
+   return environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &context)
+      && (context == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE
+       || context == RETRO_SAVESTATE_CONTEXT_SAME_INSTANCE_MANAGED);
+}
+
+/* Whether the frame being run is kept and run for the first time: a
+ * frontend that cannot say runs every frame so */
+static bool frame_retained(void)
+{
+   enum retro_execution_phase phase = RETRO_EXECUTION_PHASE_RETAINED;
+   return !environ_cb(RETRO_ENVIRONMENT_GET_EXECUTION_PHASE, &phase)
+      || phase == RETRO_EXECUTION_PHASE_RETAINED;
+}
+
+/* Whether the frontend shows this frame's picture: Run-Ahead's kept
+ * frames and Preemptive Frames' replays are run with video off. A
+ * frontend that cannot say shows every frame */
+static bool frame_shown(void)
+{
+   int flags = 0;
+   return !environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &flags)
+      || (flags & RETRO_AV_ENABLE_VIDEO);
+}
+
+static bool state_managed(void)
+{
+   int context = RETRO_SAVESTATE_CONTEXT_NORMAL;
+   return state_lifetime
+      && environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &context)
+      && context == RETRO_SAVESTATE_CONTEXT_SAME_INSTANCE_MANAGED;
+}
+
+/* magic, slot, generation, flags */
+#define STATE_TOKEN_SNAPSHOT 1u /* names a snapshot */
+#define STATE_TOKEN_VRAM_OLD 2u /* VRAM before the token not brought up to date */
+
+static void state_token_write(uint8_t *end, uint32_t flags, uint32_t slot, uint32_t gen)
+{
+   uint32_t t[4];
+   t[0] = STATE_TOKEN_MAGIC;
+   t[1] = slot;
+   t[2] = gen;
+   t[3] = flags;
+   memcpy(end - STATE_TOKEN_SIZE, t, STATE_TOKEN_SIZE);
+}
+
+/* The token's flags, 0 when it names no snapshot */
+static uint32_t state_token_read(const uint8_t *end, uint32_t *slot, uint32_t *gen)
+{
+   uint32_t t[4];
+   memcpy(t, end - STATE_TOKEN_SIZE, STATE_TOKEN_SIZE);
+   if (t[0] != STATE_TOKEN_MAGIC || !(t[3] & STATE_TOKEN_SNAPSHOT))
+      return 0;
+   *slot = t[1];
+   *gen  = t[2];
+   return t[3];
+}
+
+static void RETRO_CALLCONV state_release(const void *data, size_t size)
+{
+   uint32_t slot, gen;
+   if (data && size >= STATE_TOKEN_SIZE
+         && state_token_read((const uint8_t*)data + size, &slot, &gen) != 0)
+      rhi_intf_snapshot_release(slot, gen);
+}
+
 void retro_init(void)
 {
    struct retro_log_callback log;
@@ -4626,6 +4681,13 @@ void retro_init(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
       libretro_supports_bitmasks = true;
+
+   {
+      struct retro_savestate_lifetime lifetime;
+      lifetime.version = RETRO_SAVESTATE_LIFETIME_VERSION;
+      lifetime.release = state_release;
+      state_lifetime   = environ_cb(RETRO_ENVIRONMENT_SET_SAVESTATE_LIFETIME, &lifetime);
+   }
 
    check_system_specs();
 }
@@ -4831,6 +4893,19 @@ static void check_display_transform_variables(void)
 static void check_variables(bool startup)
 {
    struct retro_variable var = {0};
+
+   /* Options change what the GPU thread's drawing reads */
+   GPU_ThreadSettle();
+
+   var.key = BEETLE_OPT(gpu_thread);
+   psx_gpu_thread = -1;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "disabled"))
+         psx_gpu_thread = 0;
+      else if (var.value[0] >= '1' && var.value[0] <= '8')
+         psx_gpu_thread = var.value[0] - '0';
+   }
 
    /* Read before refreshing either renderer, so an option change cannot
     * rebuild storage using the previous frame's drawing policy. */
@@ -6849,6 +6924,8 @@ void retro_run(void)
    if (!PSX_CPU || !PSX_FIO || !PSX_CDC)
       return;
 
+   psx_frame_hidden = !frame_shown();
+
    /* Keep the HDR encode in sync with the frontend's live HDR controls.
     * RetroArch's paper-white and Colour Boost sliders change at runtime and
     * do NOT fire the core's variable-update path, so re-query them each frame
@@ -7059,6 +7136,12 @@ void retro_run(void)
    espec->SoundBufSize = 0;
 
    FrontIO_UpdateInput(PSX_FIO);
+   /* A light gun samples the picture line by line as it is scanned out:
+    * each line it reads waits for the GPU thread, which costs more than the
+    * thread gains unless a lane count is chosen */
+   GPU_RefreshTiming();
+   GPU_ThreadSelect(psx_gpu_thread < 0 && FrontIO_ReadsScanout(PSX_FIO)
+         ? 0 : psx_gpu_thread);
    GPU_StartFrame(espec);
 
    Running = -1;
@@ -7067,6 +7150,8 @@ void retro_run(void)
    assert(timestamp);
 
    ForceEventUpdates(timestamp);
+
+   GPU_ThreadFrameEnd();
 
    /* The deferred SW-renderer scanout records collected during this
     * frame's emulation (psx_gpu_rasterize_both_fields) are drained in
@@ -7084,7 +7169,10 @@ void retro_run(void)
 
    RebaseTS(timestamp);
 
-   // Save memcards if dirty.
+   /* Save memcards if dirty. Only the frames a frontend keeps and runs
+    * for the first time count: a replayed frame's time was counted once,
+    * and a speculative frame's card writes are thrown away with it */
+   if (frame_retained())
    {
       unsigned players = input_get_player_count();
       int i;
@@ -7336,7 +7424,11 @@ void retro_run(void)
       audio_batch_cb(&IntermediateBuffer[0][0], spec.SoundBufSize);
    }
 
-   if (GPU_get_display_possibly_dirty() || (GPU_get_display_change_count() != 0))
+   /* A change to the display is shown once: a hidden frame leaves it to
+    * the next frame shown, which would otherwise repeat the picture the
+    * frontend has from before it */
+   if (     !psx_frame_hidden
+         && (GPU_get_display_possibly_dirty() || GPU_get_display_change_count() != 0))
    {
       internal_frame_count++;
       GPU_set_display_change_count(0);
@@ -7440,6 +7532,7 @@ void retro_deinit(void)
    display_internal_framerate = false;
    display_notifications      = true;
    psx_frame_duping         = false;
+   psx_frame_hidden         = false;
    reset_hdr_output_state();
 
    /* Capability flags re-detected by retro_init. */
@@ -7546,6 +7639,7 @@ void retro_set_video_refresh(retro_video_refresh_t cb)
 
 size_t retro_serialize_size(void)
 {
+   size_t token = state_managed() ? STATE_TOKEN_SIZE : 0;
    if (enable_variable_serialization_size)
    {
       StateMem st;
@@ -7561,10 +7655,10 @@ size_t retro_serialize_size(void)
       if (!MDFNSS_SaveSM(&st, 0, 0, NULL, NULL, NULL))
          return 0;
 
-      return st.len;
+      return st.len + token;
    }
 
-   return DEFAULT_STATE_SIZE; // 16MB
+   return DEFAULT_STATE_SIZE + token; // 16MB
 }
 
 bool UsingFastSavestates(void)
@@ -7582,9 +7676,17 @@ bool retro_serialize(void *data, size_t size)
 {
    StateMem st;
    bool     ret;
+   bool     managed = state_managed();
+   uint32_t flags   = 0, slot = 0, gen = 0;
 
    if (!data || size == 0)
       return false;
+   if (managed)
+   {
+      if (size <= STATE_TOKEN_SIZE)
+         return false;
+      size -= STATE_TOKEN_SIZE;
+   }
 
    /* Same defensive check as retro_unserialize - StateAction touches
     * every subsystem and segfaults if any of them are NULL. */
@@ -7599,9 +7701,29 @@ bool retro_serialize(void *data, size_t size)
    st.fixed          = true;
    st.sizing         = false;
 
+   /* The snapshot first: the GPU's VRAM is then in it, and the state need
+    * not fetch it back */
+   if (managed && rhi_intf_snapshot_save(&slot, &gen))
+   {
+      flags = STATE_TOKEN_SNAPSHOT;
+      if (!rhi_intf_has_software_renderer())
+         flags |= STATE_TOKEN_VRAM_OLD;
+      GPU_SetStateSnapshotSaved(true);
+   }
+
    FastSaveStates = UsingFastSavestates();
    ret            = MDFNSS_SaveSM(&st, 0, 0, NULL, NULL, NULL);
    FastSaveStates = false;
+   GPU_SetStateSnapshotSaved(false);
+
+   if (managed)
+   {
+      /* A refused save is never released: its slot goes back now */
+      if (!ret && flags)
+         rhi_intf_snapshot_release(slot, gen);
+      else if (ret)
+         state_token_write((uint8_t*)data + size + STATE_TOKEN_SIZE, flags, slot, gen);
+   }
 
    if (!ret)
       log_cb(RETRO_LOG_ERROR,
@@ -7627,6 +7749,26 @@ bool retro_unserialize(const void *data, size_t size)
    if (!data || size == 0 || !MainRAM || !PSX_CDC || !PSX_CPU || !PSX_FIO)
       return false;
 
+   if (state_managed())
+   {
+      uint32_t slot, gen, flags;
+      if (size <= STATE_TOKEN_SIZE)
+         return false;
+      flags = state_token_read((const uint8_t*)data + size, &slot, &gen);
+      if (flags)
+      {
+         /* Without its snapshot, a state that left VRAM behind is no state */
+         if (!rhi_intf_snapshot_valid(slot, gen))
+         {
+            if (flags & STATE_TOKEN_VRAM_OLD)
+               return false;
+         }
+         else
+            GPU_SetStateSnapshot(true, slot, gen);
+      }
+      size -= STATE_TOKEN_SIZE;
+   }
+
    st.data           = (uint8_t*)data;
    st.loc            = 0;
    st.len            = size;
@@ -7636,8 +7778,11 @@ bool retro_unserialize(const void *data, size_t size)
    st.sizing         = false;
 
    FastSaveStates = UsingFastSavestates();
+   FrontIO_SetStateLoadMarksMemcardsDirty(!state_same_instance());
    okay           = MDFNSS_LoadSM(&st, 0, 0);
+   FrontIO_SetStateLoadMarksMemcardsDirty(true);
    FastSaveStates = false;
+   GPU_SetStateSnapshot(false, 0, 0);
    return okay;
 }
 

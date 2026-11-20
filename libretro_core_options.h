@@ -330,12 +330,32 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       BEETLE_OPT(renderer_software_fb),
       "Software Framebuffer",
       NULL,
-      "Enable accurate emulation of framebuffer effects (e.g. motion blur, FF7 battle swirl) when using hardware renderers by running a copy of the software renderer at native resolution in the background. If disabled, these operations are omitted (OpenGL) or rendered on the GPU (Vulkan). Disabling can improve performance but may cause severe graphical errors. Leave enabled if unsure.",
+      "Keeps a native-resolution copy of VRAM drawn by the software renderer alongside the hardware renderer, on the GPU Thread where it can run. The game's reads of VRAM and savestates then come from that copy, exactly as the hardware would give them. Disabled, they are read back from the GPU, which stalls emulation and, at an upscaled internal resolution, gives the game downscaled pixels that can show as graphical errors. Disabling only saves time where the GPU Thread does not run: on a single fast core, with a light gun connected, or where the CPU's cores are not reported, unless a lane count is chosen. Leave enabled if unsure.",
       NULL,
       "video",
       {
          { "disabled", NULL },
          { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+   {
+      BEETLE_OPT(gpu_thread),
+      "GPU Thread",
+      NULL,
+      "Draws the software renderer's picture, and the Software Framebuffer under the hardware renderers, on a thread of its own when the CPU has two or more fast cores. 'Enabled' also splits upscaled pictures across the fast cores left over, in bands of rows; a number of lanes splits every picture across that many threads. With a light gun connected, or where the CPU's cores are not reported, 'Enabled' keeps drawing on the emulation thread; a number of lanes starts the threads anyway. The picture and the emulated timing are the same either way.",
+      NULL,
+      "video",
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { "1",        "1 Lane" },
+         { "2",        "2 Lanes" },
+         { "3",        "3 Lanes" },
+         { "4",        "4 Lanes" },
+         { "6",        "6 Lanes" },
+         { "8",        "8 Lanes" },
          { NULL, NULL },
       },
       "enabled"

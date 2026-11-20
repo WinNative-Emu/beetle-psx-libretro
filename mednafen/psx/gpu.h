@@ -16,6 +16,16 @@
 #define INCMD_FBWRITE  4
 #define INCMD_FBREAD   8
 
+/* Which part of the work a PS_GPU instance does.  INLINE does all of it
+ * on the emulation thread.  With the GPU thread running, the emulation
+ * thread's instance is FRONT: it decodes every GP0 command for emulated
+ * timing and for the GL/Vulkan renderers, without touching VRAM.  The GPU
+ * thread's instance is BACK: it runs the same commands from the ring and
+ * draws them into VRAM, with no timing and no renderer calls. */
+#define GPU_ROLE_INLINE 0
+#define GPU_ROLE_FRONT  1
+#define GPU_ROLE_BACK   2
+
 #define DISP_VERT480    0x04
 #define DISP_PAL        0x08
 #define DISP_RGB24      0x10
@@ -106,6 +116,19 @@ struct PS_GPU
    /* Beetle-psx upscaling vars */
    uint8_t upscale_shift;
    uint8_t dither_upscale_shift;
+   uint8_t role;        /* GPU_ROLE_* */
+   /* Band lanes (gpu_thread.c): 0, this instance draws every row; else
+    * the rotation's lane count, of which it draws band_lane's bands of 8
+    * native rows; GPU_BAND_NONE, it draws nothing and only follows the
+    * raster state. */
+   uint8_t band_lanes;
+   uint8_t band_lane;
+   /* Record where each texture cache index was last read (tc_pos), so the
+    * lanes' caches can be merged into the one drawing in order would have */
+   uint8_t tc_track;
+   /* GPU_TIMING_*, from role and upscale_shift (gpu_set_role): who
+    * charges DrawTimeAvail for what the drawing reads */
+   uint8_t timing;
 
    // Drawing stuff
    int32_t ClipX0;
@@ -272,11 +295,46 @@ struct PS_GPU
     * addressing); direct sites index [y][value][x]. */
    uint8_t DitherLUT[4][512][4];
 
+   /* Texture cache tags as emulated GPU timing sees them at an upscale:
+    * the polygon timing walk and sprites fill them at native resolution,
+    * so DrawTimeAvail does not depend on the internal resolution. At 1x
+    * the TexCache tags serve timing and these are unused. */
+   uint32_t TexCacheTimingTag[256];
+   /* The line of the last timing fetch: its tag is known to match */
+   uint32_t last_timing_line;
+
+   /* Texture cache reads in drawing order while the lanes draw bands: the
+    * stamp of the last read of each index, for the merge.  tc_draw counts
+    * draws in its upper bits; a lane drawing bands stamps each row it
+    * draws with (draw << 16) | row.  Unused, and not kept, otherwise. */
+   uint64_t tc_pos[256];
+   uint64_t tc_draw;
+   uint64_t tc_stamp;
+   /* The texture cache and its stamps before a triangle the Line Render
+    * enhancement adds, put back after it (gpu_polygon.c) */
+   uint64_t tc_pos_line[256];
+   struct TexCache_t TexCache_line[256];
+
+   /* The emulation thread's account of the command it last ran, for the
+    * lanes' hazards (gpu_thread.c): native rectangles as x | y << 16 and
+    * w | h << 16, written, and read from the texture page and CLUT */
+   uint32_t fp_write[2];
+   uint32_t fp_page[2];
+   uint32_t fp_clut[2];
+   bool     fp_textured;
+   bool     tc_invalidated;  /* the texture cache was invalidated */
+
    /*
    VRAM has to be a ptr type or else we have to rely on smartcode void* shenanigans to
    wrestle a variable-sized struct.
    */
    uint16_t *vram;
+
+   /* PGXP vertices of the command being run, as the emulation thread
+    * resolved them: written there and read back on the GPU thread, four
+    * words each, from the command's ring record. */
+   uint32_t *pgxp_side;
+   unsigned  pgxp_side_n;
 };
 typedef struct PS_GPU PS_GPU;
 
@@ -317,7 +375,6 @@ void GPU_WakeVirtual(void);
 
 /* True while the GPU's event is virtual. */
 bool GPU_EventVirtual(void);
-int32_t  GPU_GetScanlineNum(void);
 
 /* Used by rhi_lib_gl.c to access the VRAM contents and
  * to drive state restore points. */
@@ -325,6 +382,8 @@ uint16_t *GPU_get_vram(void);
 void     GPU_RestoreStateP1(bool load, bool sizing);
 void     GPU_RestoreStateP2(bool load);
 void     GPU_RestoreStateP3(void);
+void     GPU_SetStateSnapshot(bool on, uint32_t slot, uint32_t gen);
+void     GPU_SetStateSnapshotSaved(bool on);
 
 void GPU_set_dither_upscale_shift(uint8_t factor);
 
@@ -380,6 +439,22 @@ void GPU_InvalidateScanoutCache(void);
 bool GPU_LoanComplete(int32_t lines);
 
 int GPU_StateAction(StateMem *sm, int load, int data_only);
+
+/* Software drawing on a thread of its own (gpu_thread.c).  Once per frame,
+ * before it starts: 0, draw inline; -1, on the GPU thread, with band lanes
+ * for the fast cores the emulation thread leaves, drawing bands when the
+ * picture is upscaled; n, on n lanes always drawing bands.  Needs a
+ * software renderer or framebuffer, and nothing reading the picture line
+ * by line. */
+void     GPU_ThreadSelect(int lanes);
+/* Who charges emulated draw time, after the renderer or PGXP changed */
+void     GPU_RefreshTiming(void);
+/* After the frame's emulation: a software-rendered frame waits for its
+ * picture; the GPU renderers' frames hand over what is pending. */
+void     GPU_ThreadFrameEnd(void);
+/* Before core options or a renderer change what the drawing reads, or a
+ * renderer reads VRAM outside the GP0 stream. */
+void     GPU_ThreadSettle(void);
 
 void GPU_set_visible_scanlines(int sls, int sle); // Beetle PSX addition
 

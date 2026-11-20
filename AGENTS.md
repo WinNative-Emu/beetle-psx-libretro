@@ -62,3 +62,26 @@ ever edited in this core.
 - `sh tools/gpu_span/run.sh` - the software rasterizer's textured spans
   against VRAM and frame hashes pinned from the scalar renderer, at 1x, 2x
   and 4x. Needs a built core; runs an ARM build under qemu too.
+- `sh tools/gpu_thread/run.sh` - the GPU thread against the inline
+  renderer: VRAM, pictures, GPUREAD and emulated GPU timing with the thread
+  off, on and switched mid-run, at 1x, 2x and 4x, with PGXP and the "Off"
+  deinterlacer. Needs a built core; build the core and the host with
+  `-fsanitize=thread` (`CC="cc -fsanitize=thread"`) to check the drains.
+- `sh tools/memcard_rollback/run.sh` - under Run-Ahead and Preemptive
+  Frames a card the game writes reaches its file during play, two seconds
+  of kept frames after the write, and is not written again unchanged.
+  Needs a built core.
+- `sh tools/hidden_frames/run.sh` - with Frame Duping on, a change to the
+  display made in a frame the frontend hides (Run-Ahead, Preemptive
+  Frames) still reaches the screen. Needs a built core.
+- `sh tools/vkhost/runahead_lanes.sh` - Run-Ahead on the Vulkan renderer:
+  frames run with video off draw no picture, and the frames shown are
+  those of a frontend that reports video on throughout. Needs a HAVE_HW=1
+  build and a Vulkan device (lavapipe works).
+- `sh tools/vkhost/lifetime_lanes.sh` - managed savestates on the Vulkan
+  renderer: a rollback every frame with the frontend's lifetime callbacks
+  gives the frames of a run without one, at 1x to 4x, with the Software
+  Framebuffer, adaptive smoothing and HDR; managed saves read no VRAM back
+  with the Software Framebuffer off, and a state released before its load
+  is refused when it needs its snapshot. Needs a HAVE_HW=1 build and a
+  Vulkan device (lavapipe works).

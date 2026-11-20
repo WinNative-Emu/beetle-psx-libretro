@@ -21,11 +21,9 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
 void rhi_gl_set_tex_window(uint8_t tww, uint8_t twh,
                            uint8_t twx, uint8_t twy);
 
-void rhi_gl_set_mask_setting(uint32_t mask_set_or, uint32_t mask_eval_and);
 
 void rhi_gl_invalidate_clut_cache(void);
 
-void rhi_gl_set_draw_offset(int16_t x, int16_t y);
 
 void rhi_gl_set_draw_area(uint16_t x0, uint16_t y0,
                           uint16_t x1, uint16_t y1);
@@ -97,7 +95,7 @@ void rhi_gl_push_line(int16_t p0x, int16_t p0y,
 
 void rhi_gl_load_image(uint16_t x, uint16_t y,
                        uint16_t w, uint16_t h,
-                       uint16_t *vram,
+                       const uint16_t *src, uint32_t stride,
                        bool mask_test, bool set_mask);
 
 bool rhi_gl_read_vram(uint16_t x, uint16_t y,

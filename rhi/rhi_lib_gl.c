@@ -1023,7 +1023,6 @@ struct gl_draw_config
    uint16_t display_resolution[2];
    bool     display_24bpp;
    bool     display_off;
-   int16_t  draw_offset[2];
    uint16_t draw_area_top_left[2];
    uint16_t draw_area_bot_right[2];
    uint16_t display_area_hrange[2];
@@ -1206,7 +1205,7 @@ struct gl_renderer {
    GLint image_load_loc[5];
    /* The command program's per-flush and per-batch uniforms (GL_CMD_LOC_*),
     * resolved when the program is built. */
-   GLint cmd_loc[12];
+   GLint cmd_loc[11];
    /* Unit quad that rect programs place with their "rect" uniform. */
    GLuint quad_vao;
    GLuint quad_vbo;
@@ -1396,8 +1395,7 @@ static gl_draw_config persistent_config = {
    false,          /* display_24bpp */
    true,           /* display_off */
    {0, 0},         /* draw_area_top_left */
-   {0, 0},         /* draw_area_dimensions */
-   {0, 0},         /* draw_offset */
+   {0, 0},         /* draw_area_bot_right */
    {0x200, 0xC00}, /* display_area_hrange (hardware reset values)*/
    {0x10, 0x100},  /* display_area_vrange (hardware reset values)*/ 
    false,          /* is_pal */
@@ -2214,6 +2212,7 @@ static void gl_upload_scratch_free(void)
 }
 #endif
 
+/* sub_data is the rectangle's first pixel, its rows row_len apart. */
 static void gl_texture_set_sub_image_window(
       struct gl_texture *tex,
       uint16_t top_left[2],
@@ -2221,7 +2220,7 @@ static void gl_texture_set_sub_image_window(
       size_t row_len,
       GLenum format,
       GLenum ty,
-      uint16_t* data)
+      const uint16_t *sub_data)
 {
    uint16_t x         = top_left[0];
    uint16_t y         = top_left[1];
@@ -2229,8 +2228,6 @@ static void gl_texture_set_sub_image_window(
    /* Callers split wrap-around VRAM transfers at the 1024x512 seams,
     * so this function always receives a contiguous source and a
     * destination rectangle contained within the texture. */
-   size_t index       = ((size_t) y) * row_len + ((size_t) x);
-   uint16_t* sub_data = &( data[index] );
 
    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint) row_len);
    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -3211,8 +3208,6 @@ static void gl_primitive_draw_rect(const gl_renderer *renderer,
    {
       float px, py;
       gl_command_vertex_get_xy(v + i, &px, &py);
-      px += renderer->config.draw_offset[0];
-      py += renderer->config.draw_offset[1];
       if (px < min_x)
          min_x = px;
       if (px > max_x)
@@ -3503,8 +3498,7 @@ enum
 
 enum
 {
-   GL_CMD_LOC_OFFSET = 0,
-   GL_CMD_LOC_FEEDBACK_UPSCALING,
+   GL_CMD_LOC_FEEDBACK_UPSCALING = 0,
    GL_CMD_LOC_SEMI,
    GL_CMD_LOC_MASK,
    GL_CMD_LOC_NATIVE,
@@ -3575,8 +3569,6 @@ static void gl_renderer_upload_indices(gl_renderer *renderer)
 
 static void gl_renderer_draw(gl_renderer *renderer)
 {
-   int16_t x;
-   int16_t y;
    size_t bi;
    GLint semi_uniform = -1, mask_uniform = -1, native_uniform = -1;
    GLint color_uniform = -1, hot_uniform = -1;
@@ -3600,9 +3592,6 @@ static void gl_renderer_draw(gl_renderer *renderer)
       return;
    }
 
-   x = renderer->config.draw_offset[0];
-   y = renderer->config.draw_offset[1];
-
    if (renderer->command_buffer->program)
    {
       /* Every batch still writes its values, including after auxiliary
@@ -3613,7 +3602,6 @@ static void gl_renderer_draw(gl_renderer *renderer)
       color_uniform = renderer->cmd_loc[GL_CMD_LOC_COLOR];
       hot_uniform = renderer->cmd_loc[GL_CMD_LOC_HOT];
       glUseProgram(renderer->command_buffer->program->id);
-      glUniform2i(renderer->cmd_loc[GL_CMD_LOC_OFFSET], (GLint)x, (GLint)y);
       glActiveTexture(GL_TEXTURE2);
       glBindTexture(GL_TEXTURE_2D, renderer->palette_texture.id);
       glUniform1ui(renderer->cmd_loc[GL_CMD_LOC_FEEDBACK_UPSCALING],
@@ -3906,14 +3894,14 @@ static void gl_renderer_draw(gl_renderer *renderer)
 
 static void gl_command_locate(gl_renderer *renderer)
 {
-   static const char *const names[12] = {
-      "offset", "feedback_upscaling", "draw_semi_transparent",
+   static const char *const names[11] = {
+      "feedback_upscaling", "draw_semi_transparent",
       "force_mask_bit", "native_blend", "color_blend", "hdr_hot",
       "hd_enabled", "hd_vram_rect", "hd_texel_rect", "force_zero",
       "force_ceiling"
    };
    unsigned i;
-   for (i = 0; i < 12; i++)
+   for (i = 0; i < 11; i++)
       renderer->cmd_loc[i] = renderer->command_buffer->program
          ? gl_uniform_map_get(&renderer->command_buffer->program->uniforms, names[i])
          : -1;
@@ -4051,7 +4039,7 @@ static void gl_renderer_upload_textures(
 #else
          GL_UNSIGNED_SHORT_1_5_5_5_REV,
 #endif
-         pixel_buffer);
+         pixel_buffer + (size_t)top_left[1] * VRAM_WIDTH_PIXELS + top_left[0]);
 
    x_start    = top_left[0];
    x_end      = x_start + dimensions[0];
@@ -4544,7 +4532,7 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
       if (renderer->tracker)
       {
          TTRect _full = { 0, 0, (unsigned)VRAM_WIDTH_PIXELS, (unsigned)VRAM_HEIGHT };
-         texture_tracker_upload(renderer->tracker, _full, GPU_get_vram());
+         texture_tracker_upload(renderer->tracker, _full, GPU_get_vram(), 0);
       }
    }
 
@@ -6793,8 +6781,8 @@ static bool gl_native_positions(const gl_renderer *renderer,
       return false;
    for (i = 0; i < count; i++)
    {
-      float px = v[i].position[0] + renderer->config.draw_offset[0];
-      float py = v[i].position[1] + renderer->config.draw_offset[1];
+      float px = v[i].position[0];
+      float py = v[i].position[1];
       if (v[i].position[3] != 1.0f ||
           !(px >= -32768.0f && px <= 32767.0f) ||
           !(py >= -32768.0f && py <= 32767.0f))
@@ -7274,10 +7262,6 @@ static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op)
                                op->u.set_tex_window.twx,
                                op->u.set_tex_window.twy);
          break;
-      case RHI_DEFER_SET_DRAW_OFFSET:
-         rhi_gl_set_draw_offset(op->u.set_draw_offset.x,
-                                op->u.set_draw_offset.y);
-         break;
       case RHI_DEFER_SET_DRAW_AREA:
          rhi_gl_set_draw_area(op->u.set_draw_area.x0,
                               op->u.set_draw_area.y0,
@@ -7310,7 +7294,7 @@ static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op)
                            op->u.load_image.y,
                            op->u.load_image.w,
                            op->u.load_image.h,
-                           op->u.load_image.vram,
+                           op->u.load_image.vram, 0,
                            op->u.load_image.mask_test,
                            op->u.load_image.set_mask);
          break;
@@ -7940,17 +7924,18 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
     * viewer), and only against a frame presented at the frontend's
     * current resolution with nothing changing in it: the display state a
     * change sets is drawn a frame later, so the frame after a change is
-    * drawn too. Draws above still resolve into VRAM. */
+    * drawn too. Draws above still resolve into VRAM. A frame the frontend
+    * throws away is not drawn either. */
    display_changed = GPU_get_display_change_count()
       || GPU_get_display_possibly_dirty();
-   if (     psx_frame_duping
+   if (psx_frame_hidden || (psx_frame_duping
          && !display_changed
          && !renderer->config.is_480i
          && !renderer->display_vram
          && psx_video_cable == GL_CABLE_NONE
          && renderer->presented_resolution
          && renderer->presented_resolution
-            == gl_packed_frontend_resolution(renderer))
+            == gl_packed_frontend_resolution(renderer)))
    {
       glDisable(GL_SCISSOR_TEST);
       glDisable(GL_DEPTH_TEST);
@@ -8219,49 +8204,6 @@ void rhi_gl_invalidate_clut_cache(void)
 
    renderer->palette_cache_valid = false;
    renderer->palette_cache_saved = false;
-}
-
-void rhi_gl_set_mask_setting(uint32_t mask_set_or, uint32_t mask_eval_and)
-{
-   /* No-op for the GL backend.  The PS1 GPU's mask state
-    * (MaskSetOR / MaskEvalAND) is forwarded to the renderer
-    * per-draw via the `mask_test` and `set_mask` parameters on
-    * each push_primitive / rhi_gl_load_image / rhi_gl_copy_rect /
-    * rhi_gl_fill_rect call (see e.g. push_primitive's mask_test
-    * argument).  The GL renderer batches by mask_test value (see
-    * the comparison in gl_renderer_*_finalize) and never reads
-    * any persistent renderer-global mask register, so there's
-    * nothing for this entry point to update.
-    *
-    * The interface exists because the rhi_intf vtable is shared
-    * across SW / GL / Vulkan backends, and at least one backend
-    * (the SW path, kept in sync via the gpu.cpp-side MaskSetOR /
-    * MaskEvalAND fields) does care about the global form of this
-    * state.  For GL the per-draw values are sufficient. */
-   (void)mask_set_or;
-   (void)mask_eval_and;
-}
-
-void rhi_gl_set_draw_offset(int16_t x, int16_t y)
-{
-   gl_renderer *renderer;
-
-   if (static_renderer.state == GL_STATE_INVALID)
-      return;
-
-   renderer = static_renderer.state_data;
-   if (!renderer)
-   {
-      rhi_defer_push_set_draw_offset(&gl_defer_queue, x, y);
-      return;
-   }
-
-   /* Finish drawing anything with the current offset */
-   if (!gl_draw_buffer_is_empty(renderer->command_buffer))
-      gl_renderer_draw(renderer);
-
-   renderer->config.draw_offset[0] = x;
-   renderer->config.draw_offset[1] = y;
 }
 
 void rhi_gl_set_draw_area(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
@@ -8937,7 +8879,7 @@ void rhi_gl_push_line(
 void rhi_gl_load_image(
       uint16_t x, uint16_t y,
       uint16_t w, uint16_t h,
-      uint16_t *vram,
+      const uint16_t *src, uint32_t stride,
       bool mask_test, bool set_mask)
 {
    gl_renderer *renderer;
@@ -8964,10 +8906,11 @@ void rhi_gl_load_image(
        * appeared after a savestate-load (which replays the entire
        * 1MiB VRAM blob via GPU_RestoreStateP3()). Defer the upload;
        * gl_context_reset's drain will replay it on the live
-       * renderer. The captured `vram` pointer aliases GPU.vram,
-       * which lives for the whole core lifetime - safe to hold. */
+       * renderer. The replay reads GPU.vram, which lives for the
+       * whole core lifetime and by then holds the upload, so even a
+       * source lent for this call alone is not kept. */
       rhi_defer_push_load_image(&gl_defer_queue,
-            x, y, w, h, vram, mask_test, set_mask);
+            x, y, w, h, stride ? GPU_get_vram() : src, mask_test, set_mask);
       return;
    }
 
@@ -9001,7 +8944,9 @@ void rhi_gl_load_image(
                   yi ? 0 : y,
                   widths[xi],
                   heights[yi],
-                  vram,
+                  stride ? src + (size_t)(yi ? heights[0] : 0) * stride
+                        + (xi ? widths[0] : 0) : src,
+                  stride,
                   mask_test,
                   set_mask);
          }
@@ -9018,7 +8963,7 @@ void rhi_gl_load_image(
       TTRect _ntu_rect;
       _ntu_rect.x = x; _ntu_rect.y = y;
       _ntu_rect.width = w; _ntu_rect.height = h;
-      texture_tracker_upload(renderer->tracker, _ntu_rect, vram);
+      texture_tracker_upload(renderer->tracker, _ntu_rect, src, stride);
    }
 
    top_left[0]            = x;
@@ -9035,14 +8980,14 @@ void rhi_gl_load_image(
          &renderer->fb_texture,
          top_left,
          dimensions,
-         (size_t) VRAM_WIDTH_PIXELS,
+         (size_t) RHI_SRC_PITCH(stride),
          GL_RGBA,
 #ifdef HAVE_OPENGLES3
          GL_UNSIGNED_SHORT_5_5_5_1,
 #else
          GL_UNSIGNED_SHORT_1_5_5_5_REV,
 #endif
-         vram);
+         RHI_SRC_ROW(src, stride, x, y, 0));
 
    x_start    = top_left[0];
    x_end      = x_start + dimensions[0];
@@ -9095,7 +9040,7 @@ void rhi_gl_load_image(
     * 5-bit channel to float and the readback rounds it back, so a
     * correct stack returns the exact bytes; a mismatch localises the
     * corruption to the upload/redraw side and names the first pixel. */
-   if (GL_DIAG_ON() && !gl_diag_nested &&
+   if (GL_DIAG_ON() && !gl_diag_nested && !stride &&
        x == 0 && y == 0 && w == VRAM_WIDTH_PIXELS && h == VRAM_HEIGHT)
    {
       uint16_t *again = (uint16_t *)malloc(
@@ -9104,7 +9049,7 @@ void rhi_gl_load_image(
       {
          gl_diag_nested = 1;
          if (rhi_gl_read_vram(0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT, again))
-            gl_diag_compare_vram("RESTORE ROUNDTRIP", vram, again);
+            gl_diag_compare_vram("RESTORE ROUNDTRIP", src, again);
          gl_diag_nested = 0;
          free(again);
       }
